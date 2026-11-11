@@ -223,35 +223,35 @@ const Palette = struct {
 };
 
 const dark_pal: Palette = .{
-    .bg = 0x202020,
-    .card = 0x2B2B2B,
-    .card_border = 0x383838,
-    .field = 0x333333,
-    .field_border = 0x454545,
-    .text = 0xFFFFFF,
-    .text2 = 0xA8A8A8,
-    .accent = 0x60CDFF,
-    .on_accent = 0x000000,
-    .btn = 0x373737,
-    .btn_border = 0x474747,
-    .sel = 0x3A3A3A,
-    .good = 0x6CCB5F,
+    .bg = 0x0C0F12,
+    .card = 0x151C26,
+    .card_border = 0x1E2B38,
+    .field = 0x1A212D,
+    .field_border = 0x2A3845,
+    .text = 0xF0F4F8,
+    .text2 = 0x8A96A8,
+    .accent = 0xF838BD,
+    .on_accent = 0x0A0D12,
+    .btn = 0x1E2836,
+    .btn_border = 0x2E3846,
+    .sel = 0x1F2D3E,
+    .good = 0xB76EE7,
 };
 
 const light_pal: Palette = .{
-    .bg = 0xF3F3F3,
+    .bg = 0xF7F9FC,
     .card = 0xFFFFFF,
-    .card_border = 0xE5E5E5,
-    .field = 0xFBFBFB,
-    .field_border = 0xD6D6D6,
-    .text = 0x1B1B1B,
-    .text2 = 0x606060,
-    .accent = 0x0067C0,
+    .card_border = 0xE2E8F0,
+    .field = 0xF8FAFC,
+    .field_border = 0xD1DAE8,
+    .text = 0x0F1419,
+    .text2 = 0x5A6B7F,
+    .accent = 0xE8388B,
     .on_accent = 0xFFFFFF,
-    .btn = 0xFDFDFD,
-    .btn_border = 0xE0E0E0,
-    .sel = 0xECECEC,
-    .good = 0x0F7B0F,
+    .btn = 0xFCFDFE,
+    .btn_border = 0xDFE6F0,
+    .sel = 0xF0F4F9,
+    .good = 0x6E38E7,
 };
 
 var pal: Palette = dark_pal;
@@ -281,11 +281,15 @@ fn argb(rgb: u32) u32 {
 }
 
 fn mix(a: u32, b: u32, t: u32) u32 {
+    return mixRatio(a, b, t, 100);
+}
+
+fn mixRatio(a: u32, b: u32, t: u32, denominator: u32) u32 {
     var out: u32 = 0;
     inline for (.{ 16, 8, 0 }) |sh| {
         const ca: u32 = (a >> sh) & 0xFF;
         const cb: u32 = (b >> sh) & 0xFF;
-        const c: u32 = (ca * (100 - t) + cb * t) / 100;
+        const c: u32 = (ca * (denominator - t) + cb * t) / denominator;
         out |= c << sh;
     }
     return out;
@@ -518,6 +522,7 @@ var anim_on = false;
 var anim_btns: [24]HWND = undefined;
 var anim_hot: [24]i32 = undefined;
 var anim_n: usize = 0;
+var hover_tick_at: u64 = 0;
 
 var prog_shown: i32 = 0;
 
@@ -635,13 +640,13 @@ fn rrect(hdc: HDC, x: i32, y: i32, w: i32, h: i32, r: i32, fill: ?u32, border: ?
 
 fn drawCard(hdc: HDC, b: Box) void {
     const s = sbox(b);
-    rrect(hdc, s.x, s.y, s.w, s.h, S(8), pal.card, pal.card_border);
+    rrect(hdc, s.x, s.y, s.w, s.h, S(12), pal.card, pal.card_border);
 }
 
 fn drawField(hdc: HDC, b: Box, id: usize, caption: []const u8) void {
     const s = sbox(b);
-    rrect(hdc, s.x, s.y, s.w, s.h, S(5), pal.field, pal.field_border);
-    text(hdc, f_small, pal.text2, caption, s.x + S(10), s.y, S(80), s.h, DT_V);
+    rrect(hdc, s.x, s.y, s.w, s.h, S(8), pal.field, pal.field_border);
+    text(hdc, f_small, pal.text2, caption, s.x + S(12), s.y, S(80), s.h, DT_V);
     if (focused_id == id) {
         rrect(hdc, s.x + S(3), s.y + s.h - S(3), s.w - S(6), S(2), 1, pal.accent, null);
     }
@@ -693,7 +698,7 @@ fn paintMain(hwnd: HWND) void {
 
     const busy_now = busy.load(.acquire);
 
-    text(mdc, f_title, pal.text, "Memfract", S(20), S(10), S(130), S(36), DT_V);
+    text(mdc, f_title, pal.text, "Memfract", S(20), S(12), S(130), S(36), DT_V);
 
     if (picker) {
         drawCard(mdc, b_card_pick);
@@ -705,17 +710,15 @@ fn paintMain(hwnd: HWND) void {
         drawCard(mdc, b_card_tbl);
 
         var cb: [64]u8 = undefined;
-        // The scan thread owns the match list: only read it after observing
-        // busy == false (the release store synchronizes with this acquire load).
         const found_s: []const u8 = if (busy_now)
             "Scanning..."
         else
             std.fmt.bufPrint(&cb, "Found: {d}{s}", .{ sc.matches.items.len, if (sc.truncated) " (truncated)" else "" }) catch "";
-        text(mdc, f_semi, pal.text, found_s, S(b_card_res.x + 16), S(b_card_res.y + 8), S(b_card_res.w - 32), S(24), DT_V);
+        text(mdc, f_semi, pal.text, found_s, S(b_card_res.x + 16), S(b_card_res.y + 10), S(b_card_res.w - 32), S(24), DT_V);
         const rw = b_results.w;
-        note(mdc, "Address", b_results.x + @divTrunc(rw * 12, 408), b_card_res.y + 36, 150);
-        note(mdc, "Value", b_results.x + @divTrunc(rw * 190, 408), b_card_res.y + 36, 100);
-        note(mdc, "Previous", b_results.x + @divTrunc(rw * 300, 408), b_card_res.y + 36, 100);
+        note(mdc, "Address", b_results.x + @divTrunc(rw * 12, 408), b_card_res.y + 38, 150);
+        note(mdc, "Value", b_results.x + @divTrunc(rw * 190, 408), b_card_res.y + 38, 100);
+        note(mdc, "Previous", b_results.x + @divTrunc(rw * 300, 408), b_card_res.y + 38, 100);
 
         drawField(mdc, valueBox(), ID_VALUE, "Value");
         if (cond_mode == .between) drawField(mdc, b_value2, ID_VALUE2, "To");
@@ -735,13 +738,13 @@ fn paintMain(hwnd: HWND) void {
     }
 
     if (popup_kind != .none) {
-        rrect(mdc, popup_rc.x - 1, popup_rc.y - 1, popup_rc.w + 2, popup_rc.h + 2, S(6), null, pal.field_border);
+        rrect(mdc, popup_rc.x - 1, popup_rc.y - 1, popup_rc.w + 2, popup_rc.h + 2, S(8), null, pal.card_border);
     }
 
     const fy = S(b_footer.y);
-    rrect(mdc, S(20), fy + S(14), S(8), S(8), S(4), if (busy_now) pal.accent else pal.good, null);
+    rrect(mdc, S(22), fy + S(14), S(8), S(8), S(4), if (busy_now) pal.accent else pal.good, null);
     const status_w = if (busy_now) S(@max(220, lw - 440)) else S(lw - 180);
-    text(mdc, f_body, pal.text2, status_buf[0..status_len], S(36), fy + S(4), status_w, S(28), DT_V);
+    text(mdc, f_body, pal.text2, status_buf[0..status_len], S(38), fy + S(4), status_w, S(28), DT_V);
     if (busy_now) {
         const pr: i32 = prog_shown;
         const bw = S(200);
@@ -785,6 +788,38 @@ fn hoverAmount(h: HWND) i32 {
 }
 
 fn drawButton(di: *const DRAWITEMSTRUCT) void {
+    drawBuffered(di, drawButtonContent);
+}
+
+fn drawBuffered(di: *const DRAWITEMSTRUCT, comptime draw: fn (*const DRAWITEMSTRUCT) void) void {
+    const w = di.rcItem.right - di.rcItem.left;
+    const h = di.rcItem.bottom - di.rcItem.top;
+    if (w <= 0 or h <= 0) return;
+
+    const mdc = CreateCompatibleDC(di.hDC) orelse {
+        draw(di);
+        return;
+    };
+    defer _ = DeleteDC(mdc);
+    const bmp = CreateCompatibleBitmap(di.hDC, w, h) orelse {
+        draw(di);
+        return;
+    };
+    defer _ = DeleteObject(bmp);
+    const old = SelectObject(mdc, bmp) orelse {
+        draw(di);
+        return;
+    };
+    defer _ = SelectObject(mdc, old);
+
+    var buffered = di.*;
+    buffered.hDC = mdc;
+    buffered.rcItem = .{ .left = 0, .top = 0, .right = w, .bottom = h };
+    draw(&buffered);
+    _ = BitBlt(di.hDC, di.rcItem.left, di.rcItem.top, w, h, mdc, 0, 0, 0x00CC0020);
+}
+
+fn drawButtonContent(di: *const DRAWITEMSTRUCT) void {
     const id: usize = di.CtlID;
     const rc = di.rcItem;
     const w = rc.right - rc.left;
@@ -802,18 +837,18 @@ fn drawButton(di: *const DRAWITEMSTRUCT) void {
     const label_s = getText(di.hwndItem, &tb);
 
     if (st == .check) {
-        const bsz = S(18);
+        const bsz = S(20);
         const by = rc.top + @divTrunc(h - bsz, 2);
-        rrect(hdc, rc.left + S(2), by, bsz, bsz, S(4), if (writable_only) pal.accent else pal.field, if (writable_only) null else pal.field_border);
+        rrect(hdc, rc.left + S(2), by, bsz, bsz, S(6), if (writable_only) pal.accent else pal.field, if (writable_only) null else pal.field_border);
         if (writable_only) text(hdc, f_semi, pal.on_accent, "✓", rc.left + S(2), by, bsz, bsz, DT_V | DT_CENTER);
-        text(hdc, f_body, if (hot) pal.text else pal.text2, label_s, rc.left + S(30), rc.top, w - S(30), h, DT_V);
+        text(hdc, f_body, if (hot) pal.text else pal.text2, label_s, rc.left + S(32), rc.top, w - S(32), h, DT_V);
         return;
     }
 
     var fill: u32 = pal.btn;
     var border: ?u32 = pal.btn_border;
     var fg: u32 = pal.text;
-    var radius: i32 = S(5);
+    var radius: i32 = S(8);
     switch (st) {
         .accent => {
             fill = pal.accent;
@@ -836,19 +871,22 @@ fn drawButton(di: *const DRAWITEMSTRUCT) void {
         fg = pal.text2;
         fill = pal.card;
     } else if (pressed) {
-        fill = mix(fill, pal.bg, 30);
+        fill = mix(fill, pal.bg, 35);
     } else if (hv > 0) {
-        fill = mix(fill, pal.text, @intCast(@divTrunc(9 * hv, 100)));
+        fill = mixRatio(fill, pal.text, @intCast(8 * hv), 10000);
     }
 
     rrect(hdc, rc.left, rc.top, w, h, radius, fill, border);
 
     if (st == .pill) {
         const dot = if (proc != null) pal.good else pal.text2;
-        rrect(hdc, rc.left + S(14), rc.top + @divTrunc(h - S(8), 2), S(8), S(8), S(4), dot, null);
-        text(hdc, f_body, fg, label_s, rc.left + S(30), rc.top, w - S(40), h, DT_V);
+        rrect(hdc, rc.left + S(16), rc.top + @divTrunc(h - S(8), 2), S(8), S(8), S(4), dot, null);
+        text(hdc, f_semi, fg, label_s, rc.left + S(32), rc.top, w - S(44), h, DT_V);
     } else if (st == .dropdown and id != ID_MORE) {
-        text(hdc, f_body, fg, label_s, rc.left + S(12), rc.top, w - S(16), h, DT_V);
+        const expanded = (id == ID_DD_TYPE and popup_kind == .type) or (id == ID_DD_COND and popup_kind == .cond);
+        if (expanded) rrect(hdc, rc.left, rc.top, w, h, radius, null, pal.accent);
+        text(hdc, f_body, fg, label_s, rc.left + S(14), rc.top, w - S(48), h, DT_V);
+        text(hdc, f_body, if (expanded) pal.accent else pal.text2, if (expanded) "⌃" else "⌄", rc.right - S(32), rc.top, S(20), h, DT_V | DT_CENTER);
     } else {
         text(hdc, f_semi, fg, label_s, rc.left, rc.top, w, h, DT_V | DT_CENTER);
     }
@@ -863,6 +901,10 @@ fn rowValueText(row: Row, vb: []u8) []const u8 {
 }
 
 fn drawListItem(di: *const DRAWITEMSTRUCT) void {
+    drawBuffered(di, drawListItemContent);
+}
+
+fn drawListItemContent(di: *const DRAWITEMSTRUCT) void {
     if (di.itemID == 0xFFFFFFFF) return;
     const idx: usize = di.itemID;
     const id: usize = di.CtlID;
@@ -873,17 +915,17 @@ fn drawListItem(di: *const DRAWITEMSTRUCT) void {
 
     fillRgb(hdc, rc, pal.card);
     if (id != ID_POPUP and (di.itemState & 1) != 0) {
-        rrect(hdc, rc.left + S(2), rc.top + S(2), w - S(4), h - S(4), S(5), pal.sel, null);
-        rrect(hdc, rc.left + S(4), rc.top + @divTrunc(h - S(16), 2), S(3), S(16), 1, pal.accent, null);
+        rrect(hdc, rc.left + S(3), rc.top + S(2), w - S(6), h - S(4), S(7), pal.sel, null);
+        rrect(hdc, rc.left + S(6), rc.top + @divTrunc(h - S(18), 2), S(3), S(18), 2, pal.accent, null);
     }
 
     if (id == ID_PROCS) {
         if (idx >= procs.items.len) return;
         const e = procs.items[idx];
-        text(hdc, f_body, pal.text, e.name[0..e.name_len], rc.left + S(16), rc.top, w - S(116), h, DT_V);
+        text(hdc, f_semi, pal.text, e.name[0..e.name_len], rc.left + S(18), rc.top, w - S(120), h, DT_V);
         var pb: [32]u8 = undefined;
         const pid_s = std.fmt.bufPrint(&pb, "PID {d}", .{e.pid}) catch "";
-        text(hdc, f_small, pal.text2, pid_s, rc.right - S(100), rc.top, S(90), h, DT_V | DT_RIGHT);
+        text(hdc, f_small, pal.text2, pid_s, rc.right - S(104), rc.top, S(94), h, DT_V | DT_RIGHT);
     } else if (id == ID_RESULTS) {
         if (busy.load(.acquire) or idx >= sc.matches.items.len) return;
         const m = sc.matches.items[idx];
@@ -915,10 +957,10 @@ fn drawListItem(di: *const DRAWITEMSTRUCT) void {
         const type_x = rc.left + @divTrunc(w * 564, 896);
         const val_x = rc.left + @divTrunc(w * 664, 896);
 
-        const bsz = S(16);
+        const bsz = S(18);
         const cx = rc.left + S(20);
         const cy = rc.top + @divTrunc(h - bsz, 2);
-        rrect(hdc, cx, cy, bsz, bsz, S(4), if (row.frozen) pal.accent else pal.field, if (row.frozen) null else pal.field_border);
+        rrect(hdc, cx, cy, bsz, bsz, S(5), if (row.frozen) pal.accent else pal.field, if (row.frozen) null else pal.field_border);
         if (row.frozen) text(hdc, f_semi, pal.on_accent, "✓", cx, cy, bsz, bsz, DT_V | DT_CENTER);
 
         const desc: []const u8 = if (row.desc_len == 0) "No description" else row.desc[0..row.desc_len];
@@ -933,13 +975,52 @@ fn drawListItem(di: *const DRAWITEMSTRUCT) void {
         text(hdc, f_semi, pal.text, val_s, val_x, rc.top, rc.right - S(4) - val_x, h, DT_V);
     } else if (id == ID_POPUP) {
         if (idx >= popup_n) return;
-        if (idx == popup_hot or (di.itemState & 1) != 0) {
-            rrect(hdc, rc.left + S(4), rc.top + S(2), w - S(8), h - S(4), S(5), pal.sel, null);
-        }
         const current = idx == popup_cur;
-        if (current) rrect(hdc, rc.left + S(6), rc.top + @divTrunc(h - S(16), 2), S(3), S(16), 1, pal.accent, null);
-        text(hdc, if (current) f_semi else f_body, pal.text, popup_items[idx], rc.left + S(18), rc.top, w - S(28), h, DT_V);
+        if (idx == popup_hot or (di.itemState & 1) != 0) {
+            rrect(hdc, rc.left + S(4), rc.top + S(2), w - S(8), h - S(4), S(6), pal.sel, null);
+        } else if (current) {
+            rrect(hdc, rc.left + S(4), rc.top + S(2), w - S(8), h - S(4), S(6), mix(pal.card, pal.accent, 7), null);
+        }
+        text(hdc, f_semi, pal.text, popup_items[idx], rc.left + S(14), rc.top + S(5), w - S(48), S(20), DT_V);
+        text(hdc, f_small, pal.text2, popupDetail(idx), rc.left + S(14), rc.top + S(25), w - S(48), S(17), DT_V);
+        if (current) text(hdc, f_semi, pal.accent, "✓", rc.right - S(32), rc.top, S(20), h, DT_V | DT_CENTER);
     }
+}
+
+fn popupDetail(idx: usize) []const u8 {
+    return switch (popup_kind) {
+        .none => "",
+        .type => switch (type_kinds[idx]) {
+            .int8 => "Signed integer · 1 byte",
+            .uint8 => "Unsigned integer · 1 byte",
+            .int16 => "Signed integer · 2 bytes",
+            .uint16 => "Unsigned integer · 2 bytes",
+            .int32 => "Signed integer · 4 bytes",
+            .uint32 => "Unsigned integer · 4 bytes",
+            .int64 => "Signed integer · 8 bytes",
+            .uint64 => "Unsigned integer · 8 bytes",
+            .float32 => "Floating point · 4 bytes",
+            .float64 => "Floating point · 8 bytes",
+            else => "",
+        },
+        .cond => switch (popup_cond_list[idx]) {
+            .exact => "Matches the entered value",
+            .greater => "Above the entered value",
+            .less => "Below the entered value",
+            .between => "Within the entered range",
+            .unknown => "Start with any value",
+            .changed => "Different from the previous scan",
+            .unchanged => "Same as the previous scan",
+            .increased => "Higher than the previous scan",
+            .decreased => "Lower than the previous scan",
+        },
+        .menu => switch (idx) {
+            0 => "Change the interface appearance",
+            1 => "Export your saved addresses",
+            2 => "Restore addresses from a file",
+            else => "",
+        },
+    };
 }
 
 fn getText(h: HWND, out: []u8) []const u8 {
@@ -967,7 +1048,7 @@ fn child(parent: HWND, class: [*:0]const u16, caption_w: [*:0]const u16, style: 
 }
 
 fn editRect(field: Box, capw: i32) Box {
-    return bx(field.x + 10 + capw, field.y + 8, field.w - 20 - capw, field.h - 16);
+    return bx(field.x + 12 + capw, field.y + 8, field.w - 24 - capw, field.h - 16);
 }
 
 fn edit(parent: HWND, field: Box, id: usize, capw: i32) !HWND {
@@ -1146,9 +1227,8 @@ fn relayout() void {
 fn refreshLabels() void {
     normalizeCond();
     const kind: scan.Kind = if (scan_active) sc.kind else type_kinds[kind_sel];
-    var b: [64]u8 = undefined;
-    setText(ui.dd_type, std.fmt.bufPrint(&b, "{s}  ▾", .{@tagName(kind)}) catch "");
-    setText(ui.dd_cond, std.fmt.bufPrint(&b, "{s}  ▾", .{condLabel(cond_mode)}) catch "");
+    setText(ui.dd_type, @tagName(kind));
+    setText(ui.dd_cond, condLabel(cond_mode));
     layoutValue();
     _ = InvalidateRect(ui.btn_next, null, 0);
     _ = InvalidateRect(ui.btn_reset, null, 0);
@@ -1182,6 +1262,8 @@ fn closePopup() void {
     popup_anim = false;
     syncAnimTimer();
     show(ui.popup, false);
+    _ = InvalidateRect(ui.dd_type, null, 0);
+    _ = InvalidateRect(ui.dd_cond, null, 0);
     _ = InvalidateRect(main_wnd, null, 0);
 }
 
@@ -1189,7 +1271,7 @@ fn openPopup(kind: PopupKind) void {
     if (kind == popup_closed_kind and GetTickCount64() - popup_closed_at < 250) return;
 
     var anchor: Box = b_dd_type;
-    var width: i32 = 214;
+    var width: i32 = 280;
     var right = false;
     popup_cur = std.math.maxInt(usize);
 
@@ -1214,7 +1296,7 @@ fn openPopup(kind: PopupKind) void {
         },
         .menu => {
             anchor = b_more;
-            width = 250;
+            width = 280;
             right = true;
             popup_items[0] = if (dark_mode) "Light theme" else "Dark theme";
             popup_items[1] = "Save address table";
@@ -1227,9 +1309,11 @@ fn openPopup(kind: PopupKind) void {
     popup_hot = std.math.maxInt(usize);
     const n: i32 = @intCast(popup_n);
     const w = S(width);
-    const h = S(34) * n;
+    const h = S(48) * n;
     const x = if (right) S(anchor.x + anchor.w) - w else S(anchor.x);
-    const y = S(anchor.y + anchor.h + 4);
+    var client: RECT = undefined;
+    _ = GetClientRect(main_wnd, &client);
+    const y = @max(S(8), @min(S(anchor.y + anchor.h + 6), client.bottom - h - S(8)));
     popup_rc = .{ .x = x, .y = y, .w = w, .h = h };
     popup_final_y = y;
     popup_anim_t0 = GetTickCount64();
@@ -1241,6 +1325,8 @@ fn openPopup(kind: PopupKind) void {
     _ = SendMessageW(ui.popup, LB_SETCURSEL, std.math.maxInt(usize), 0);
     show(ui.popup, true);
     _ = BringWindowToTop(ui.popup);
+    _ = InvalidateRect(ui.dd_type, null, 0);
+    _ = InvalidateRect(ui.dd_cond, null, 0);
     _ = SetFocus(ui.popup);
     _ = InvalidateRect(ui.popup, null, 0);
     _ = InvalidateRect(main_wnd, null, 0);
@@ -1757,6 +1843,10 @@ fn freezeTick() void {
 }
 
 fn hoverTick() void {
+    const now = GetTickCount64();
+    const elapsed: u64 = if (hover_tick_at == 0) 16 else @min(now - hover_tick_at, 160);
+    hover_tick_at = now;
+    const step: i32 = @intCast(@min(100, elapsed * 100 / 160));
     popupHoverTick();
     refreshResultsOnScroll();
     var pt: POINT = undefined;
@@ -1766,9 +1856,11 @@ fn hoverTick() void {
         const target: i32 = if (w != null and w.? == bh) 100 else 0;
         const cur = anim_hot[i];
         if (cur == target) continue;
-        const step: i32 = 34;
-        anim_hot[i] = if (cur < target) @min(target, cur + step) else @max(target, cur - step);
-        _ = InvalidateRect(bh, null, 0);
+        const new_val = if (cur < target) @min(target, cur + step) else @max(target, cur - step);
+        if (new_val != cur) {
+            anim_hot[i] = new_val;
+            _ = InvalidateRect(bh, null, 0);
+        }
     }
 }
 
@@ -1935,7 +2027,7 @@ fn wndProc(hwnd: HWND, msg: u32, wp: usize, lp: isize) callconv(.winapi) isize {
             show(ui.popup, false);
             refreshLabels();
             setStatus("Click Select process at the top to attach to a program", .{});
-            _ = SetTimer(hwnd, TIMER_HOVER, 50, null);
+            _ = SetTimer(hwnd, TIMER_HOVER, 16, null);
             _ = SetTimer(hwnd, TIMER_LIVE, 500, null);
             return 0;
         },
@@ -1962,6 +2054,7 @@ fn wndProc(hwnd: HWND, msg: u32, wp: usize, lp: isize) callconv(.winapi) isize {
                 ID_PROCS => S(38),
                 ID_TABLE => S(30),
                 ID_RESULTS => S(30),
+                ID_POPUP => S(48),
                 else => S(34),
             };
             mi.itemHeight = @intCast(hgt);
@@ -2032,11 +2125,11 @@ pub fn main() !void {
     if (GdiplusStartup(&gdip_token, &gin, null) != 0) return error.GdiplusFailed;
     defer GdiplusShutdown(gdip_token);
 
-    f_body = try mkFont(14, 400, L("Segoe UI"));
-    f_semi = try mkFont(14, 600, L("Segoe UI"));
-    f_title = try mkFont(22, 600, L("Segoe UI"));
-    f_small = try mkFont(12, 400, L("Segoe UI"));
-    f_mono = try mkFont(13, 400, L("Consolas"));
+    f_body = try mkFont(14, 400, L("Segoe UI Variable Display"));
+    f_semi = try mkFont(14, 600, L("Segoe UI Variable Display"));
+    f_title = try mkFont(24, 600, L("Segoe UI Variable Display"));
+    f_small = try mkFont(12, 400, L("Segoe UI Variable Display"));
+    f_mono = try mkFont(13, 400, L("Cascadia Mono"));
 
     hinst = GetModuleHandleW(null) orelse return error.NoModuleHandle;
     const class = L("MemfractWindow");
