@@ -1,0 +1,38 @@
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+  workflow_dispatch:
+
+jobs:
+  build:
+    runs-on: windows-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: mlugg/setup-zig@v2
+        with:
+          version: 0.17.0
+
+      - name: Format check
+        run: zig fmt --check build.zig src tests
+
+      - name: Unit tests
+        run: zig build test
+
+      - name: Build
+        run: zig build --release=safe
+
+      - name: Smoke test
+        run: zig build smoke --release=safe
+
+      - name: Upload artifacts
+        uses: actions/upload-artifact@v4
+        with:
+          name: memfract-windows-x64
+          path: |
+            zig-out/bin/memfract.exe
+            zig-out/bin/memfract-gui.exe
+          if-no-files-found: error

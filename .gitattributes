@@ -1,0 +1,9 @@
+* text=auto eol=lf
+
+*.zig   text eol=lf
+*.zon   text eol=lf
+*.md    text eol=lf
+*.ps1   text eol=crlf
+
+*.exe   binary
+*.pdb   binary

@@ -1,0 +1,10 @@
+.zig-cache/
+zig-out/
+
+*.exe
+*.pdb
+
+*.session
+memfract_table.txt
+
+$fixture
