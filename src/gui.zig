@@ -436,8 +436,8 @@ const PopupKind = enum { none, type, cond, menu };
 
 const first_modes = [_]scan.Mode{ .exact, .greater, .less, .between, .unknown };
 const next_modes = [_]scan.Mode{ .exact, .greater, .less, .between, .changed, .unchanged, .increased, .decreased };
-const type_kinds = [_]scan.Kind{ .int8, .int16, .int32, .int64, .float32, .float64 };
-const type_names = [_][]const u8{ "int8", "int16", "int32", "int64", "float32", "float64" };
+const type_kinds = [_]scan.Kind{ .int8, .uint8, .int16, .uint16, .int32, .uint32, .int64, .uint64, .float32, .float64 };
+const type_names = [_][]const u8{ "int8", "uint8", "int16", "uint16", "int32", "uint32", "int64", "uint64", "float32", "float64" };
 
 fn kindIndex(kind: scan.Kind) usize {
     return std.mem.indexOfScalar(scan.Kind, &type_kinds, kind) orelse 0;
@@ -496,7 +496,7 @@ var main_wnd: HWND = undefined;
 var hinst: HINSTANCE = undefined;
 var focused_id: usize = 0;
 var picker: bool = false;
-var kind_sel: usize = 2;
+var kind_sel: usize = 4;
 var cond_mode: scan.Mode = .exact;
 var writable_only: bool = true;
 var scan_active: bool = false;
@@ -1410,7 +1410,7 @@ fn attach() void {
 
 fn scanThread(_: ?*anyopaque) callconv(.winapi) u32 {
     if (job.first) {
-        sc.first(gpa, job.p, job.kind, job.cond, job.writable, .{}) catch |e| {
+        sc.first(gpa, job.p, job.kind, job.cond, job.writable, .{}, job.kind.size()) catch |e| {
             job.err = @errorName(e);
         };
     } else {

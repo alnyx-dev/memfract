@@ -9,8 +9,9 @@ A Windows x64 memory scanner written in Zig: a JSON CLI for automation and a Flu
 ## Features
 
 - List processes, loaded modules, and memory regions.
-- Scan for `int8`, `int16`, `int32`, `int64`, `float32`, and `float64` values.
-- Limit a first scan to a module or an address range (`--module`, `--start`, `--end`).
+- Scan for `int8`, `int16`, `int32`, `int64`, `uint8`, `uint16`, `uint32`, `uint64`, `float32`, and `float64` values.
+- Integer values accept decimal, hex (`0x..`), octal, and binary literals.
+- Limit a first scan to a module or an address range (`--module`, `--start`, `--end`) and choose the address alignment (`--align`, use `1` for unaligned values).
 - Conditions: exact, greater/less, between, changed/unchanged, increased/decreased, unknown initial value.
 - Pointer chains (`module+offset`, `--offsets`) and stable addresses.
 - Address table with descriptions, save/load in a GUI-compatible text format.

@@ -6,7 +6,7 @@ const help_text =
     \\Commands:
     \\  ps [filter]              list processes
     \\  attach <pid>             attach to a process
-    \\  scan <type> <value>      first scan (types: int8 int16 int32 int64 float32 float64)
+    \\  scan <type> <value>      first scan (types: int8 int16 int32 int64 uint8 uint16 uint32 uint64 float32 float64)
     \\  next <value>             keep addresses with the new exact value
     \\  changed                  keep addresses whose value changed
     \\  unchanged                keep addresses whose value did not change

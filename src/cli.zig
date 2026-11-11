@@ -53,7 +53,7 @@ const value_opts = [_][]const u8{
     "--pid",       "--process", "--type",   "--cond",    "--value",   "--value2",  "--addr",
     "--size",      "--limit",   "--offset", "--session", "--filter",  "--for",     "--interval",
     "--count",     "--desc",    "--index",  "--file",    "--timeout", "--offsets", "--tol",
-    "--from-scan", "--module",  "--start",  "--end",
+    "--from-scan", "--module",  "--start",  "--end",     "--align",
 };
 
 fn takesValue(t: []const u8) bool {
@@ -453,7 +453,15 @@ fn resolveAddr(a: std.mem.Allocator, s: *Session, p: win.Process, args: Args) !u
 fn kindArg(args: Args) !scan.Kind {
     const t = args.opt("--type") orelse return .int32;
     return scan.Kind.parse(t) orelse
-        return fail(error.BadArgs, "unknown --type '{s}' (int8, int16, int32, int64, float32, float64)", .{t});
+        return fail(error.BadArgs, "unknown --type '{s}' (int8, int16, int32, int64, uint8, uint16, uint32, uint64, float32, float64)", .{t});
+}
+
+fn alignmentArg(args: Args, kind: scan.Kind) !usize {
+    const t = args.opt("--align") orelse return kind.size();
+    const n = try parseU64(t);
+    if (n == 0 or n > 64 or n & (n - 1) != 0)
+        return fail(error.BadArgs, "--align must be a power of two between 1 and 64", .{});
+    return @intCast(n);
 }
 
 fn scanRange(a: std.mem.Allocator, s: *Session, args: Args) !scan.Range {
@@ -534,6 +542,10 @@ fn emitValue(w: *json.Writer, kind: scan.Kind, b: []const u8) !void {
         .int16 => try w.int(std.mem.readInt(i16, b[0..2], .little)),
         .int32 => try w.int(std.mem.readInt(i32, b[0..4], .little)),
         .int64 => try w.int(std.mem.readInt(i64, b[0..8], .little)),
+        .uint8 => try w.int(std.mem.readInt(u8, b[0..1], .little)),
+        .uint16 => try w.int(std.mem.readInt(u16, b[0..2], .little)),
+        .uint32 => try w.int(std.mem.readInt(u32, b[0..4], .little)),
+        .uint64 => try w.int(std.mem.readInt(u64, b[0..8], .little)),
         .float32 => try w.float32(@bitCast(std.mem.readInt(u32, b[0..4], .little))),
         .float64 => try w.float(@bitCast(std.mem.readInt(u64, b[0..8], .little))),
     }
@@ -621,7 +633,7 @@ const help_entries = [_]HelpEntry{
     .{ .name = "detach", .usage = "detach", .desc = "Forget the selected process and clear scan results." },
     .{ .name = "read", .usage = "read --addr A [--offsets o1,o2] (--type T | --size N)", .desc = "Read a typed value or a hex dump. A is 0x... or module+offset. --offsets follows a pointer chain." },
     .{ .name = "write", .usage = "write --addr A --value V [--type T] [--offsets o1,o2]", .desc = "Write a value and read it back." },
-    .{ .name = "scan first", .usage = "scan first [--type T] [--cond C] [--value V] [--value2 V] [--module NAME] [--start A] [--end A] [--all] [--tol X] [--timeout MS]", .desc = "First scan. Conds: exact, greater, less, between, unknown. Scans writable memory unless --all; --module/--start/--end limit the address range." },
+    .{ .name = "scan first", .usage = "scan first [--type T] [--cond C] [--value V] [--value2 V] [--module NAME] [--start A] [--end A] [--align N] [--all] [--tol X] [--timeout MS]", .desc = "First scan. Conds: exact, greater, less, between, unknown. Scans writable memory unless --all; --module/--start/--end limit the address range. --align N (a power of two, default the type size) sets the address alignment; use --align 1 for unaligned values." },
     .{ .name = "scan next", .usage = "scan next --cond C [--value V] [--value2 V] [--tol X] [--timeout MS]", .desc = "Filter previous results. Conds: exact, greater, less, between, changed, unchanged, increased, decreased." },
     .{ .name = "scan list", .usage = "scan list [--offset N] [--limit N]", .desc = "Show results with current and previous values (limit <= 10000, default 50)." },
     .{ .name = "scan status", .usage = "scan status", .desc = "Scan state: count, type, truncated flag." },
@@ -642,7 +654,8 @@ const help_notes = [_][]const u8{
     "Every response is a single JSON object on one line: {\"ok\":true,...} or {\"ok\":false,\"error\":{\"code\":...,\"message\":...}}.",
     "Exit codes: 0 success, 1 runtime error, 2 usage error.",
     "Addresses are strings like \"0x00007FF6A1B2C3D4\". Input accepts hex (0x..), decimal, or module+offset (game.exe+0x1A2B3C).",
-    "Types: int8, int16, int32, int64, float32, float64. Float 'exact' matches with rounding tolerance derived from the typed digits (use --tol 0 for bit-exact).",
+    "Types: int8, int16, int32, int64, uint8, uint16, uint32, uint64, float32, float64. Float 'exact' matches with rounding tolerance derived from the typed digits (use --tol 0 for bit-exact).",
+    "Integer values accept decimal, hex (0x..), octal (0o..), and binary (0b..) literals; --addr accepts 0x.., decimal, or module+offset.",
     "One-shot mode keeps scan state in %TEMP%\\memfract\\<session>.session (--session NAME, default 'default'; --no-session disables). Use 'serve' for many commands without disk I/O.",
     "Typical flow: ps -> attach -> scan first -> (change value in target) -> scan next -> scan list -> table add -> write/freeze.",
     "Run as Administrator to open most processes. Not for use against online games or protected processes.",
@@ -811,11 +824,12 @@ fn cmdScan(a: std.mem.Allocator, s: *Session, args: Args, w: *json.Writer) !void
         }
         const cond = try buildCond(kind, mode, args);
         const range = try scanRange(a, s, args);
+        const alignment = try alignmentArg(args, kind);
         const timeout = try timeoutArg(args);
 
         startWatchdog(timeout);
         const t0 = GetTickCount64();
-        const res = s.sc.first(gpa, p, kind, cond, !args.flag("--all"), range);
+        const res = s.sc.first(gpa, p, kind, cond, !args.flag("--all"), range, alignment);
         stopWatchdog();
         res catch |e| {
             if (e == error.Canceled) {
