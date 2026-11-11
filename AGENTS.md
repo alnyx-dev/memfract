@@ -79,6 +79,14 @@ Run `zig build test` before every commit, and `zig build smoke` after touching `
 
 ## Conventions
 
+- Everything in the code is in English: identifiers, string literals, error and log
+  messages, test names, comments. The only exception is test data that exists to check
+  non-ASCII handling (for example Cyrillic descriptions in `util.zig` tests).
+- Write code that explains itself through names and structure, and avoid comments.
+  Add a comment only for a non-obvious moment (a Win32 quirk, an ordering requirement,
+  a subtle invariant), and keep it to one short line. Do not comment what the code
+  plainly does, do not leave commented-out code, and do not add banner or section
+  comments. Do not add doc comments to code that is already clear.
 - Descriptions and any user text that gets truncated must go through `util.clipUtf8`;
   never slice UTF-8 by bytes. Loading cleans invalid UTF-8 with `cleanUtf8`, which
   drops the whole string.
