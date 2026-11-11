@@ -69,6 +69,23 @@ try {
     $rows = Invoke-Cli table list --session $session
     if ($rows.count -ne 1) { throw "table list returned $($rows.count) rows" }
 
+    $strScan = Invoke-Cli scan first --type string --value memfract-needle --module fixture.exe --session $session
+    if ($strScan.count -lt 1) { throw "string scan found nothing" }
+    $strList = Invoke-Cli scan list --limit 10000 --session $session
+    if (-not ($strList.results.value -contains 'memfract-needle')) {
+        throw "string scan did not return the fixture string"
+    }
+
+    $sigScan = Invoke-Cli scan first --type bytes --value '48 8B ?? ?? 89' --module fixture.exe --session $session
+    if ($sigScan.count -lt 1) { throw "byte-pattern scan found nothing" }
+    $sigList = Invoke-Cli scan list --limit 10000 --session $session
+    if (-not ($sigList.results.value -contains '48 8b 90 12 89')) {
+        throw "byte-pattern scan did not return the fixture signature"
+    }
+
+    $sigNext = Invoke-Cli scan next --cond unchanged --session $session
+    if ($sigNext.count -lt 1) { throw "unchanged filter dropped every byte-pattern match" }
+
     $detached = Invoke-Cli detach --session $session
     if (-not $detached.detached) { throw "detach failed" }
 

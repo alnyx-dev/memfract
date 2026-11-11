@@ -12,6 +12,8 @@ pub const Kind = enum {
     uint16,
     uint32,
     uint64,
+    string,
+    bytes,
 
     pub fn size(k: Kind) usize {
         return switch (k) {
@@ -19,6 +21,7 @@ pub const Kind = enum {
             .int16, .uint16 => 2,
             .int32, .float32, .uint32 => 4,
             .int64, .float64, .uint64 => 8,
+            .string, .bytes => 0,
         };
     }
 
@@ -26,10 +29,19 @@ pub const Kind = enum {
         return k == .float32 or k == .float64;
     }
 
+    /// Types whose value length comes from the pattern, not from the type.
+    pub fn isVariable(k: Kind) bool {
+        return k == .string or k == .bytes;
+    }
+
     pub fn parse(name: []const u8) ?Kind {
         return std.meta.stringToEnum(Kind, name);
     }
 };
+
+pub const Encoding = enum { utf8, utf16le };
+
+pub const max_value_len = 256;
 
 pub const Value = struct {
     bytes: [8]u8 = std.mem.zeroes([8]u8),
@@ -54,6 +66,7 @@ pub fn encode(kind: Kind, text: []const u8) !Value {
             const f = try std.fmt.parseFloat(f64, text);
             std.mem.writeInt(u64, v.bytes[0..8], @bitCast(f), .little);
         },
+        .string, .bytes => return error.UnsupportedType,
     }
     return v;
 }
@@ -75,8 +88,41 @@ pub fn fmtValue(kind: Kind, b: []const u8, buf: []u8) []const u8 {
         .uint64 => std.fmt.bufPrint(buf, "{d}", .{std.mem.readInt(u64, b[0..8], .little)}),
         .float32 => std.fmt.bufPrint(buf, "{d}", .{@as(f32, @bitCast(std.mem.readInt(u32, b[0..4], .little)))}),
         .float64 => std.fmt.bufPrint(buf, "{d}", .{@as(f64, @bitCast(std.mem.readInt(u64, b[0..8], .little)))}),
+        .string, .bytes => "?",
     };
     return r catch "?";
+}
+
+/// Display a match of any type in a short, single-line form.
+pub fn fmtValueAny(kind: Kind, encoding: Encoding, b: []const u8, buf: []u8) []const u8 {
+    return switch (kind) {
+        .string => decodeText(encoding, b, buf) orelse asciiPreview(b, buf),
+        .bytes => hexPreview(b, buf),
+        else => fmtValue(kind, b, buf),
+    };
+}
+
+fn asciiPreview(b: []const u8, buf: []u8) []const u8 {
+    const n = @min(b.len, buf.len);
+    for (b[0..n], 0..) |c, i| buf[i] = if (c >= 0x20 and c < 0x7F) c else '.';
+    return buf[0..n];
+}
+
+fn hexPreview(b: []const u8, buf: []u8) []const u8 {
+    if (buf.len < 3) return "";
+    const digits = "0123456789abcdef";
+    var n: usize = 0;
+    for (b) |c| {
+        if (n + 3 > buf.len) {
+            buf[n] = '.';
+            buf[n + 1] = '.';
+            return buf[0 .. n + 2];
+        }
+        buf[n] = digits[c >> 4];
+        buf[n + 1] = digits[c & 15];
+        n += 2;
+    }
+    return buf[0..n];
 }
 
 fn asF64(kind: Kind, b: []const u8) f64 {
@@ -109,6 +155,7 @@ pub fn cmpVal(kind: Kind, x: []const u8, y: []const u8) ?std.math.Order {
             if (std.math.isNan(a) or std.math.isNan(b)) return null;
             return std.math.order(a, b);
         },
+        .string, .bytes => return null,
     }
 }
 
@@ -129,10 +176,54 @@ pub const Cond = struct {
     a: Value = .{},
     b: Value = .{},
     tol: f64 = 0,
+    pattern: [max_value_len]u8 = undefined,
+    pattern_len: usize = 0,
+    /// 1 = byte must match, 0 = wildcard. An empty mask matches every byte.
+    mask: [max_value_len]u8 = undefined,
+    mask_len: usize = 0,
+    encoding: Encoding = .utf8,
+
+    pub fn patternSlice(c: *const Cond) []const u8 {
+        return c.pattern[0..c.pattern_len];
+    }
+
+    pub fn maskSlice(c: *const Cond) []const u8 {
+        return c.mask[0..c.mask_len];
+    }
+
+    pub fn setText(c: *Cond, text: []const u8) !void {
+        const out = try encodeText(c.encoding, text, &c.pattern);
+        c.pattern_len = out.len;
+        c.mask_len = 0;
+    }
+
+    pub fn setBytePattern(c: *Cond, text: []const u8) !void {
+        const p = try parseBytePattern(text, &c.pattern, &c.mask);
+        c.pattern_len = p.bytes.len;
+        c.mask_len = p.mask.len;
+    }
 };
 
+fn patternEqual(cur: []const u8, pat: []const u8, mask: []const u8) bool {
+    if (cur.len != pat.len) return false;
+    for (cur, pat, 0..) |c, p, i| {
+        if (mask.len == 0 or mask[i] != 0) {
+            if (c != p) return false;
+        }
+    }
+    return true;
+}
+
 fn check(kind: Kind, cur: []const u8, old: []const u8, c: *const Cond) bool {
-    const sz = kind.size();
+    if (kind.isVariable()) {
+        return switch (c.mode) {
+            .exact => patternEqual(cur, c.patternSlice(), c.maskSlice()),
+            .changed => !std.mem.eql(u8, cur, old),
+            .unchanged => std.mem.eql(u8, cur, old),
+            else => false,
+        };
+    }
+    const sz = cur.len;
     switch (c.mode) {
         .unknown => return true,
         .changed => return !std.mem.eql(u8, cur, old),
@@ -172,8 +263,72 @@ fn check(kind: Kind, cur: []const u8, old: []const u8, c: *const Cond) bool {
 
 pub const Match = struct {
     addr: usize,
-    old: [8]u8,
 };
+
+pub const Pattern = struct {
+    bytes: []const u8,
+    mask: []const u8,
+};
+
+pub fn parseBytePattern(text: []const u8, bytes_out: []u8, mask_out: []u8) !Pattern {
+    var n: usize = 0;
+    var it = std.mem.tokenizeAny(u8, text, " \t");
+    while (it.next()) |tok| {
+        if (n >= bytes_out.len or n >= mask_out.len) return error.PatternTooLong;
+        var t = tok;
+        if (std.mem.eql(u8, t, "?") or std.mem.eql(u8, t, "??")) {
+            bytes_out[n] = 0;
+            mask_out[n] = 0;
+            n += 1;
+            continue;
+        }
+        if (t.len > 2 and (std.mem.startsWith(u8, t, "0x") or std.mem.startsWith(u8, t, "0X"))) t = t[2..];
+        if (t.len == 0 or t.len > 2) return error.InvalidPattern;
+        var b: u16 = 0;
+        for (t) |ch| {
+            const d = std.fmt.charToDigit(ch, 16) catch return error.InvalidPattern;
+            b = b * 16 + d;
+        }
+        bytes_out[n] = @intCast(b);
+        mask_out[n] = 1;
+        n += 1;
+    }
+    if (n == 0) return error.InvalidPattern;
+    return .{ .bytes = bytes_out[0..n], .mask = mask_out[0..n] };
+}
+
+pub fn encodeText(encoding: Encoding, text: []const u8, out: []u8) ![]const u8 {
+    switch (encoding) {
+        .utf8 => {
+            if (!std.unicode.utf8ValidateSlice(text)) return error.InvalidPattern;
+            if (text.len > out.len) return error.PatternTooLong;
+            @memcpy(out[0..text.len], text);
+            return out[0..text.len];
+        },
+        .utf16le => {
+            if (text.len > max_value_len) return error.PatternTooLong;
+            var tmp: [max_value_len / 2]u16 = undefined;
+            const n = std.unicode.utf8ToUtf16Le(&tmp, text) catch return error.InvalidPattern;
+            if (n * 2 > out.len) return error.PatternTooLong;
+            @memcpy(out[0 .. n * 2], std.mem.sliceAsBytes(tmp[0..n]));
+            return out[0 .. n * 2];
+        },
+    }
+}
+
+pub fn decodeText(encoding: Encoding, bytes: []const u8, out: []u8) ?[]const u8 {
+    switch (encoding) {
+        .utf8 => return if (std.unicode.utf8ValidateSlice(bytes)) bytes else null,
+        .utf16le => {
+            if (bytes.len % 2 != 0 or bytes.len / 2 > max_value_len / 2) return null;
+            var tmp: [max_value_len / 2]u16 = undefined;
+            var i: usize = 0;
+            while (i < bytes.len) : (i += 2) tmp[i / 2] = std.mem.readInt(u16, bytes[i..][0..2], .little);
+            const n = std.unicode.utf16LeToUtf8(out, tmp[0 .. bytes.len / 2]) catch return null;
+            return out[0..n];
+        },
+    }
+}
 
 pub var progress = std.atomic.Value(u32).init(0);
 pub var cancel_flag = std.atomic.Value(bool).init(false);
@@ -200,6 +355,9 @@ fn regionSpan(range: Range, base: usize, size: usize, alignment: usize, step: us
 pub const Scanner = struct {
     kind: Kind = .int32,
     matches: std.ArrayList(Match) = .empty,
+    values: std.ArrayList(u8) = .empty,
+    value_len: usize = 0,
+    encoding: Encoding = .utf8,
     truncated: bool = false,
 
     const chunk_size = 1 << 20;
@@ -208,6 +366,22 @@ pub const Scanner = struct {
 
     pub fn deinit(self: *Scanner, gpa: std.mem.Allocator) void {
         self.matches.deinit(gpa);
+        self.values.deinit(gpa);
+    }
+
+    pub fn valueLen(self: *const Scanner) usize {
+        return if (self.kind.isVariable()) self.value_len else self.kind.size();
+    }
+
+    pub fn valueAt(self: *const Scanner, i: usize) []const u8 {
+        const len = self.valueLen();
+        return self.values.items[i * len ..][0..len];
+    }
+
+    pub fn reset(self: *Scanner) void {
+        self.matches.clearRetainingCapacity();
+        self.values.clearRetainingCapacity();
+        self.truncated = false;
     }
 
     pub fn first(
@@ -220,12 +394,17 @@ pub const Scanner = struct {
         range: Range,
         alignment: usize,
     ) !void {
+        if (kind.isVariable()) {
+            if (cond.mode != .exact or cond.pattern_len == 0) return error.MissingPattern;
+            if (cond.pattern_len > max_value_len) return error.PatternTooLong;
+        }
         self.kind = kind;
-        self.matches.clearRetainingCapacity();
-        self.truncated = false;
+        self.encoding = cond.encoding;
+        self.value_len = if (kind.isVariable()) cond.pattern_len else kind.size();
+        self.reset();
         progress.store(0, .release);
 
-        const step = kind.size();
+        const step = self.valueLen();
         const stride = @max(alignment, 1);
 
         var regs = try proc.regions(gpa, writable_only);
@@ -246,7 +425,7 @@ pub const Scanner = struct {
             const stop = span.off + span.len;
             while (off < stop) : (off += chunk_size) {
                 if (cancel_flag.load(.acquire)) {
-                    self.matches.clearRetainingCapacity();
+                    self.reset();
                     return error.Canceled;
                 }
                 const avail = stop - off;
@@ -287,7 +466,11 @@ pub const Scanner = struct {
         stride: usize,
         starts: usize,
     ) !bool {
-        if (cond.mode == .exact and !kind.isFloat()) {
+        self.kind = kind;
+        const step = if (kind.isVariable()) cond.pattern_len else kind.size();
+        self.value_len = step;
+
+        if (cond.mode == .exact and !kind.isFloat() and !kind.isVariable()) {
             return switch (kind) {
                 .int8 => self.scanExact(gpa, i8, buf, base, std.mem.readInt(i8, cond.a.bytes[0..1], .little), stride, starts),
                 .int16 => self.scanExact(gpa, i16, buf, base, std.mem.readInt(i16, cond.a.bytes[0..2], .little), stride, starts),
@@ -300,20 +483,16 @@ pub const Scanner = struct {
                 else => unreachable,
             };
         }
-        const step = kind.size();
         var i: usize = 0;
         while (i < starts and i + step <= buf.len) : (i += stride) {
             const cur = buf[i..][0..step];
-            const hit = check(kind, cur, cur, &cond);
-            if (hit) {
-                if (self.matches.items.len >= max_matches) {
-                    self.truncated = true;
-                    return true;
-                }
-                var m: Match = .{ .addr = base + i, .old = std.mem.zeroes([8]u8) };
-                @memcpy(m.old[0..step], cur);
-                try self.matches.append(gpa, m);
+            if (!check(kind, cur, cur, &cond)) continue;
+            if (self.matches.items.len >= max_matches) {
+                self.truncated = true;
+                return true;
             }
+            try self.matches.append(gpa, .{ .addr = base + i });
+            try self.values.appendSlice(gpa, cur);
         }
         return false;
     }
@@ -337,20 +516,26 @@ pub const Scanner = struct {
                 self.truncated = true;
                 return true;
             }
-            var m: Match = .{ .addr = base + i, .old = std.mem.zeroes([8]u8) };
-            @memcpy(m.old[0..step], buf[i..][0..step]);
-            try self.matches.append(gpa, m);
+            try self.matches.append(gpa, .{ .addr = base + i });
+            try self.values.appendSlice(gpa, buf[i..][0..step]);
         }
         return false;
     }
 
+    fn moveDown(self: *Scanner, w: usize, i: usize) void {
+        const step = self.valueLen();
+        self.matches.items[w] = self.matches.items[i];
+        std.mem.copyForwards(u8, self.values.items[w * step ..][0..step], self.values.items[i * step ..][0..step]);
+    }
+
     pub fn next(self: *Scanner, proc: win.Process, cond: Cond) bool {
-        const step = self.kind.size();
+        const step = self.valueLen();
         const total = self.matches.items.len;
         var w: usize = 0;
         var i: usize = 0;
+        var canceled = false;
         var page: [page_size]u8 = undefined;
-        var cur: [8]u8 = undefined;
+        var cur: [max_value_len]u8 = undefined;
         var next_check: usize = 0;
         progress.store(0, .release);
 
@@ -361,12 +546,12 @@ pub const Scanner = struct {
                 next_check = i + 1024;
                 progress.store(@intCast(i * 1000 / total), .release);
                 if (cancel_flag.load(.acquire)) {
+                    canceled = true;
+                    const keep = total - i;
                     var k: usize = 0;
-                    while (i + k < total) : (k += 1) {
-                        self.matches.items[w + k] = self.matches.items[i + k];
-                    }
-                    self.matches.shrinkRetainingCapacity(w + (total - i));
-                    return true;
+                    while (k < keep) : (k += 1) self.moveDown(w + k, i + k);
+                    w += keep;
+                    break;
                 }
             }
 
@@ -383,13 +568,13 @@ pub const Scanner = struct {
                 // The value straddles a page boundary (not produced by aligned scans).
                 const m = self.matches.items[i];
                 i += 1;
-                proc.read(m.addr, cur[0..step]) catch continue;
-                if (check(self.kind, cur[0..step], m.old[0..step], &cond)) {
-                    var nm = m;
-                    @memcpy(nm.old[0..step], cur[0..step]);
-                    self.matches.items[w] = nm;
-                    w += 1;
-                }
+                if (proc.read(m.addr, cur[0..step])) {
+                    if (check(self.kind, cur[0..step], self.valueAt(i - 1), &cond)) {
+                        self.matches.items[w] = m;
+                        @memcpy(self.values.items[w * step ..][0..step], cur[0..step]);
+                        w += 1;
+                    }
+                } else |_| {}
                 continue;
             }
 
@@ -398,11 +583,9 @@ pub const Scanner = struct {
                 while (k < j) : (k += 1) {
                     const m = self.matches.items[k];
                     const off = m.addr - base;
-                    const now = page[off..][0..step];
-                    if (check(self.kind, now, m.old[0..step], &cond)) {
-                        var nm = m;
-                        @memcpy(nm.old[0..step], now);
-                        self.matches.items[w] = nm;
+                    if (check(self.kind, page[off..][0..step], self.valueAt(k), &cond)) {
+                        self.matches.items[w] = m;
+                        @memcpy(self.values.items[w * step ..][0..step], page[off..][0..step]);
                         w += 1;
                     }
                 }
@@ -410,8 +593,9 @@ pub const Scanner = struct {
             i = j;
         }
         self.matches.shrinkRetainingCapacity(w);
+        self.values.shrinkRetainingCapacity(w * step);
         progress.store(1000, .release);
-        return false;
+        return canceled;
     }
 };
 
@@ -623,4 +807,77 @@ test "scanBlock honors the stride" {
     _ = try sc2.scanBlock(a, .uint32, cond, &unaligned, 0x3000, 1, unaligned.len);
     try std.testing.expectEqual(@as(usize, 1), sc2.matches.items.len);
     try std.testing.expectEqual(@as(usize, 0x3005), sc2.matches.items[0].addr);
+}
+
+test "parseBytePattern accepts wildcards and rejects junk" {
+    var pb: [max_value_len]u8 = undefined;
+    var mb: [max_value_len]u8 = undefined;
+    const p = try parseBytePattern("48 8B ? ?? 0x89", &pb, &mb);
+    try std.testing.expectEqual(@as(usize, 5), p.bytes.len);
+    try std.testing.expectEqualStrings("\x48\x8b\x00\x00\x89", p.bytes);
+    try std.testing.expectEqualStrings("\x01\x01\x00\x00\x01", p.mask);
+    try std.testing.expectError(error.InvalidPattern, parseBytePattern("", &pb, &mb));
+    try std.testing.expectError(error.InvalidPattern, parseBytePattern("zz", &pb, &mb));
+    try std.testing.expectError(error.PatternTooLong, parseBytePattern("00 00 00", &pb, mb[0..2]));
+}
+
+test "string encoding roundtrip" {
+    var out: [max_value_len]u8 = undefined;
+    const utf8 = try encodeText(.utf8, "health", &out);
+    try std.testing.expectEqualStrings("health", utf8);
+    var back: [max_value_len]u8 = undefined;
+    try std.testing.expectEqualStrings("health", decodeText(.utf8, utf8, &back).?);
+
+    const utf16 = try encodeText(.utf16le, "hp", &out);
+    try std.testing.expectEqualStrings("h\x00p\x00", utf16);
+    try std.testing.expectEqualStrings("hp", decodeText(.utf16le, utf16, &back).?);
+
+    try std.testing.expectError(error.InvalidPattern, encodeText(.utf8, "\xff", &out));
+}
+
+test "scanBlock matches string and byte patterns" {
+    const a = std.testing.allocator;
+    var buf: [32]u8 = undefined;
+    @memset(buf[0..], 0);
+    @memcpy(buf[3..9], "needle");
+    buf[16] = 0x48;
+    buf[17] = 0x8B;
+    buf[18] = 0x90;
+    buf[19] = 0x7F;
+    buf[20] = 0x89;
+
+    var string_cond: Cond = .{ .mode = .exact };
+    try string_cond.setText("needle");
+    var sc: Scanner = .{};
+    defer sc.deinit(a);
+    _ = try sc.scanBlock(a, .string, string_cond, &buf, 0x1000, 1, buf.len);
+    try std.testing.expectEqual(@as(usize, 1), sc.matches.items.len);
+    try std.testing.expectEqual(@as(usize, 0x1003), sc.matches.items[0].addr);
+    try std.testing.expectEqualStrings("needle", sc.valueAt(0));
+
+    var bytes_cond: Cond = .{ .mode = .exact };
+    try bytes_cond.setBytePattern("48 8B ?? ?? 89");
+    var sc2: Scanner = .{};
+    defer sc2.deinit(a);
+    _ = try sc2.scanBlock(a, .bytes, bytes_cond, &buf, 0x2000, 1, buf.len);
+    try std.testing.expectEqual(@as(usize, 1), sc2.matches.items.len);
+    try std.testing.expectEqual(@as(usize, 0x2010), sc2.matches.items[0].addr);
+    try std.testing.expectEqualStrings("\x48\x8b\x90\x7f\x89", sc2.valueAt(0));
+}
+
+test "variable conditions compare against the stored value" {
+    var c: Cond = .{ .mode = .changed };
+    try std.testing.expect(check(.string, "ab", "aa", &c));
+    try std.testing.expect(!check(.string, "ab", "ab", &c));
+    c.mode = .unchanged;
+    try std.testing.expect(check(.string, "ab", "ab", &c));
+    c.mode = .greater;
+    try std.testing.expect(!check(.string, "ab", "aa", &c));
+}
+
+test "fmtValueAny formats strings and bytes" {
+    var buf: [48]u8 = undefined;
+    try std.testing.expectEqualStrings("hi", fmtValueAny(.string, .utf8, "hi", &buf));
+    try std.testing.expectEqualStrings("hi", fmtValueAny(.string, .utf16le, "h\x00i\x00", &buf));
+    try std.testing.expectEqualStrings("488b9000", fmtValueAny(.bytes, .utf8, "\x48\x8b\x90\x00", &buf));
 }

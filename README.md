@@ -10,9 +10,10 @@ A Windows x64 memory scanner written in Zig: a JSON CLI for automation and a Flu
 
 - List processes, loaded modules, and memory regions.
 - Scan for `int8`, `int16`, `int32`, `int64`, `uint8`, `uint16`, `uint32`, `uint64`, `float32`, and `float64` values.
+- Scan for `string` values (UTF-8 or UTF-16LE via `--encoding`) and for `bytes` patterns with wildcards such as `48 8B ?? ?? 89`.
 - Integer values accept decimal, hex (`0x..`), octal, and binary literals.
 - Limit a first scan to a module or an address range (`--module`, `--start`, `--end`) and choose the address alignment (`--align`, use `1` for unaligned values).
-- Conditions: exact, greater/less, between, changed/unchanged, increased/decreased, unknown initial value.
+- Conditions: exact, greater/less, between, changed/unchanged, increased/decreased, unknown initial value. `string` and `bytes` scans support exact, changed, and unchanged.
 - Pointer chains (`module+offset`, `--offsets`) and stable addresses.
 - Address table with descriptions, save/load in a GUI-compatible text format.
 - Two CLI modes: one-shot commands with a file-backed session, and `serve` with line-by-line JSON over stdin/stdout.
@@ -63,6 +64,10 @@ Useful build steps:
 .\zig-out\bin\memfract.exe scan first --type int32 --value 100
 .\zig-out\bin\memfract.exe scan next --cond exact --value 93
 .\zig-out\bin\memfract.exe scan list
+
+# text and byte-pattern scans
+.\zig-out\bin\memfract.exe scan first --type string --value "player health"
+.\zig-out\bin\memfract.exe scan first --type bytes --value "48 8B ?? ?? 89"
 
 # write and verify
 .\zig-out\bin\memfract.exe write --addr 0x... --value 9999

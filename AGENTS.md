@@ -47,8 +47,9 @@ Run `zig build test` before every commit, and `zig build smoke` after touching `
   command or flag, update the table and the known-flags list near the top: `help` is the
   machine-readable documentation that other tools rely on.
 - State persists between one-shot calls in `<name>.session` files (`--session NAME`).
-  The file format starts with a magic (`ZCS3`, legacy `ZCS2` is still readable). Change
-  the layout only together with a new magic and, where possible, a decoder for the old one.
+  The file format starts with a magic (`ZCS4`, legacy `ZCS3` and `ZCS2` are still
+  readable). Change the layout only together with a new magic and, where possible, a
+  decoder for the old one.
 - A session stores the target's creation time; a restarted PID must fail with
   `StaleSession`, not silently reuse results.
 - `serve` reads one command per line from stdin and keeps state in memory.

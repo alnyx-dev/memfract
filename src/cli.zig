@@ -50,10 +50,10 @@ fn exitCodeFor(e: anyerror) u8 {
 }
 
 const value_opts = [_][]const u8{
-    "--pid",       "--process", "--type",   "--cond",    "--value",   "--value2",  "--addr",
-    "--size",      "--limit",   "--offset", "--session", "--filter",  "--for",     "--interval",
-    "--count",     "--desc",    "--index",  "--file",    "--timeout", "--offsets", "--tol",
-    "--from-scan", "--module",  "--start",  "--end",     "--align",
+    "--pid",       "--process", "--type",   "--cond",    "--value",   "--value2",   "--addr",
+    "--size",      "--limit",   "--offset", "--session", "--filter",  "--for",      "--interval",
+    "--count",     "--desc",    "--index",  "--file",    "--timeout", "--offsets",  "--tol",
+    "--from-scan", "--module",  "--start",  "--end",     "--align",   "--encoding",
 };
 
 fn takesValue(t: []const u8) bool {
@@ -220,33 +220,48 @@ fn putInt(a: std.mem.Allocator, list: *std.ArrayList(u8), comptime T: type, v: T
 }
 
 const session_magic_v2 = "ZCS2";
-const session_magic = "ZCS3";
+const session_magic_v3 = "ZCS3";
+const session_magic = "ZCS4";
 
 fn decodeSession(data: []const u8, s: *Session) !void {
     var c: Cur = .{ .d = data };
     const magic = try c.take(4);
-    const old_size: usize = if (std.mem.eql(u8, magic, session_magic))
-        // ZCS3 stores only the bytes that are meaningful for the scan type.
-        0
-    else if (std.mem.eql(u8, magic, session_magic_v2))
-        8
-    else
-        return error.CorruptSession;
+    const v4 = std.mem.eql(u8, magic, session_magic);
+    const v3 = std.mem.eql(u8, magic, session_magic_v3);
+    const v2 = std.mem.eql(u8, magic, session_magic_v2);
+    if (!v4 and !v3 and !v2) return error.CorruptSession;
 
     s.pid = try c.u32_();
     s.ctime = try c.u64_();
     const kind_i = try c.u8_();
     s.scanned = (try c.u8_()) != 0;
     s.sc.truncated = (try c.u8_()) != 0;
-    _ = try c.u8_();
+    const enc_i = try c.u8_();
     s.sc.kind = std.enums.fromInt(scan.Kind, kind_i) orelse return error.CorruptSession;
 
-    const step = s.sc.kind.size();
-    const record = 8 + (if (old_size != 0) old_size else step);
+    var value_len: usize = 0;
+    if (v4) {
+        const vlen = try c.u64_();
+        if (s.sc.kind.isVariable()) {
+            if (vlen == 0 or vlen > scan.max_value_len) return error.CorruptSession;
+        } else if (vlen != s.sc.kind.size()) return error.CorruptSession;
+        value_len = @intCast(vlen);
+        s.sc.encoding = std.enums.fromInt(scan.Encoding, enc_i) orelse return error.CorruptSession;
+    } else {
+        // Older formats only ever stored fixed-width types.
+        if (s.sc.kind.isVariable()) return error.CorruptSession;
+        value_len = s.sc.kind.size();
+        s.sc.encoding = .utf8;
+    }
+    s.sc.value_len = value_len;
+
+    const stored = if (v2) 8 else value_len;
+    const record = 8 + stored;
 
     const count = try c.u64_();
     if (count > (data.len - c.p) / record) return error.CorruptSession;
     try s.sc.matches.ensureTotalCapacity(gpa, @intCast(count));
+    try s.sc.values.ensureTotalCapacity(gpa, @as(usize, @intCast(count)) * value_len);
 
     var prev: u64 = 0;
     var i: u64 = 0;
@@ -256,13 +271,9 @@ fn decodeSession(data: []const u8, s: *Session) !void {
         // and the writer never produces duplicates.
         if (i > 0 and addr <= prev) return error.CorruptSession;
         prev = addr;
-        var m: scan.Match = .{ .addr = @intCast(addr), .old = std.mem.zeroes([8]u8) };
-        if (old_size != 0) {
-            @memcpy(&m.old, try c.take(old_size));
-        } else {
-            @memcpy(m.old[0..step], try c.take(step));
-        }
-        s.sc.matches.appendAssumeCapacity(m);
+        const raw = try c.take(stored);
+        s.sc.matches.appendAssumeCapacity(.{ .addr = @intCast(addr) });
+        try s.sc.values.appendSlice(gpa, raw[0..value_len]);
     }
 
     const rows = try c.u32_();
@@ -270,6 +281,7 @@ fn decodeSession(data: []const u8, s: *Session) !void {
     while (r < rows) : (r += 1) {
         const addr = try c.u64_();
         const k = std.enums.fromInt(scan.Kind, try c.u8_()) orelse return error.CorruptSession;
+        if (k.isVariable()) return error.CorruptSession;
         const dl = try c.u16_();
         const raw_desc = try c.take(dl);
         const d = try gpa.dupe(u8, util.cleanUtf8(raw_desc));
@@ -278,7 +290,7 @@ fn decodeSession(data: []const u8, s: *Session) !void {
 }
 
 fn freeSession(s: *Session) void {
-    s.sc.matches.deinit(gpa);
+    s.sc.deinit(gpa);
     for (s.table.items) |row| gpa.free(row.desc);
     s.table.deinit(gpa);
 }
@@ -287,19 +299,23 @@ fn encodeSession(a: std.mem.Allocator, s: *Session) ![]u8 {
     var out: std.ArrayList(u8) = .empty;
     errdefer out.deinit(a);
 
+    const value_len = s.sc.valueLen();
+    if (value_len != 0 and s.sc.values.items.len != s.sc.matches.items.len * value_len)
+        return error.CorruptSession;
+
     try out.appendSlice(a, session_magic);
     try putInt(a, &out, u32, s.pid);
     try putInt(a, &out, u64, s.ctime);
     try out.append(a, @backingInt(s.sc.kind));
     try out.append(a, @intFromBool(s.scanned));
     try out.append(a, @intFromBool(s.sc.truncated));
-    try out.append(a, 0);
+    try out.append(a, @backingInt(s.sc.encoding));
+    try putInt(a, &out, u64, value_len);
 
-    const step = s.sc.kind.size();
     try putInt(a, &out, u64, s.sc.matches.items.len);
-    for (s.sc.matches.items) |m| {
+    for (s.sc.matches.items, 0..) |m, i| {
         try putInt(a, &out, u64, m.addr);
-        try out.appendSlice(a, m.old[0..step]);
+        try out.appendSlice(a, s.sc.valueAt(i));
     }
 
     if (s.table.items.len > std.math.maxInt(u32)) return error.TooManyRows;
@@ -383,8 +399,8 @@ fn attachPid(s: *Session, pid: u32) !void {
     if (s.proc) |old| old.close();
     const changed = s.pid != pid or s.ctime != ct;
     if (s.pid != pid) {
-        s.sc.matches.clearAndFree(gpa);
-        s.sc.truncated = false;
+        s.sc.deinit(gpa);
+        s.sc = .{};
         s.scanned = false;
     }
     s.proc = p;
@@ -453,7 +469,20 @@ fn resolveAddr(a: std.mem.Allocator, s: *Session, p: win.Process, args: Args) !u
 fn kindArg(args: Args) !scan.Kind {
     const t = args.opt("--type") orelse return .int32;
     return scan.Kind.parse(t) orelse
-        return fail(error.BadArgs, "unknown --type '{s}' (int8, int16, int32, int64, uint8, uint16, uint32, uint64, float32, float64)", .{t});
+        return fail(error.BadArgs, "unknown --type '{s}' (int8, int16, int32, int64, uint8, uint16, uint32, uint64, float32, float64, string, bytes)", .{t});
+}
+
+fn fixedKindArg(args: Args) !scan.Kind {
+    const kind = try kindArg(args);
+    if (kind.isVariable())
+        return fail(error.BadArgs, "--type {s} is only supported by 'scan first' and 'scan next'", .{@tagName(kind)});
+    return kind;
+}
+
+fn encodingArg(args: Args, default: scan.Encoding) !scan.Encoding {
+    const t = args.opt("--encoding") orelse return default;
+    return std.meta.stringToEnum(scan.Encoding, t) orelse
+        return fail(error.BadArgs, "unknown --encoding '{s}' (utf8, utf16le)", .{t});
 }
 
 fn alignmentArg(args: Args, kind: scan.Kind) !usize {
@@ -500,8 +529,24 @@ fn encodeArg(kind: scan.Kind, text: []const u8, what: []const u8) !scan.Value {
         return fail(error.BadArgs, "bad {s} '{s}' for type {s}", .{ what, text, @tagName(kind) });
 }
 
-fn buildCond(kind: scan.Kind, mode: scan.Mode, args: Args) !scan.Cond {
-    var cond: scan.Cond = .{ .mode = mode };
+fn buildCond(kind: scan.Kind, mode: scan.Mode, default_encoding: scan.Encoding, args: Args) !scan.Cond {
+    var cond: scan.Cond = .{ .mode = mode, .encoding = try encodingArg(args, default_encoding) };
+
+    if (kind.isVariable()) {
+        switch (mode) {
+            .exact => {},
+            .changed, .unchanged => return cond,
+            else => return fail(error.BadArgs, "cond '{s}' is not supported for type {s}", .{ @tagName(mode), @tagName(kind) }),
+        }
+        const text = args.opt("--value") orelse return fail(error.BadArgs, "cond 'exact' needs --value", .{});
+        const res = if (kind == .bytes) cond.setBytePattern(text) else cond.setText(text);
+        res catch |e| switch (e) {
+            error.PatternTooLong => return fail(error.BadArgs, "--value is longer than {d} bytes", .{scan.max_value_len}),
+            error.InvalidPattern => return fail(error.BadArgs, "bad {s} pattern '{s}'", .{ @tagName(kind), text }),
+        };
+        return cond;
+    }
+
     const needs = switch (mode) {
         .exact, .greater, .less, .between => true,
         else => false,
@@ -548,7 +593,39 @@ fn emitValue(w: *json.Writer, kind: scan.Kind, b: []const u8) !void {
         .uint64 => try w.int(std.mem.readInt(u64, b[0..8], .little)),
         .float32 => try w.float32(@bitCast(std.mem.readInt(u32, b[0..4], .little))),
         .float64 => try w.float(@bitCast(std.mem.readInt(u64, b[0..8], .little))),
+        .string, .bytes => try w.nullv(),
     }
+}
+
+fn emitValueAny(w: *json.Writer, kind: scan.Kind, encoding: scan.Encoding, b: []const u8) !void {
+    switch (kind) {
+        .string, .bytes => {
+            var buf: [scan.max_value_len * 3]u8 = undefined;
+            const s = if (kind == .string)
+                scan.fmtValueAny(kind, encoding, b, &buf)
+            else
+                hexSpaced(b, &buf);
+            try w.string(s);
+        },
+        else => try emitValue(w, kind, b),
+    }
+}
+
+fn hexSpaced(b: []const u8, buf: []u8) []const u8 {
+    const digits = "0123456789abcdef";
+    var n: usize = 0;
+    for (b, 0..) |c, i| {
+        if (i > 0) {
+            if (n == buf.len) break;
+            buf[n] = ' ';
+            n += 1;
+        }
+        if (n + 2 > buf.len) break;
+        buf[n] = digits[c >> 4];
+        buf[n + 1] = digits[c & 15];
+        n += 2;
+    }
+    return buf[0..n];
 }
 
 fn hexString(a: std.mem.Allocator, b: []const u8) ![]u8 {
@@ -633,9 +710,9 @@ const help_entries = [_]HelpEntry{
     .{ .name = "detach", .usage = "detach", .desc = "Forget the selected process and clear scan results." },
     .{ .name = "read", .usage = "read --addr A [--offsets o1,o2] (--type T | --size N)", .desc = "Read a typed value or a hex dump. A is 0x... or module+offset. --offsets follows a pointer chain." },
     .{ .name = "write", .usage = "write --addr A --value V [--type T] [--offsets o1,o2]", .desc = "Write a value and read it back." },
-    .{ .name = "scan first", .usage = "scan first [--type T] [--cond C] [--value V] [--value2 V] [--module NAME] [--start A] [--end A] [--align N] [--all] [--tol X] [--timeout MS]", .desc = "First scan. Conds: exact, greater, less, between, unknown. Scans writable memory unless --all; --module/--start/--end limit the address range. --align N (a power of two, default the type size) sets the address alignment; use --align 1 for unaligned values." },
-    .{ .name = "scan next", .usage = "scan next --cond C [--value V] [--value2 V] [--tol X] [--timeout MS]", .desc = "Filter previous results. Conds: exact, greater, less, between, changed, unchanged, increased, decreased." },
-    .{ .name = "scan list", .usage = "scan list [--offset N] [--limit N]", .desc = "Show results with current and previous values (limit <= 10000, default 50)." },
+    .{ .name = "scan first", .usage = "scan first [--type T] [--cond C] [--value V] [--value2 V] [--encoding E] [--module NAME] [--start A] [--end A] [--align N] [--all] [--tol X] [--timeout MS]", .desc = "First scan. Conds: exact, greater, less, between, unknown. Scans writable memory unless --all; --module/--start/--end limit the address range. --align N (a power of two, default the type size) sets the address alignment; use --align 1 for unaligned values. string and bytes scans need --cond exact with --value as the pattern." },
+    .{ .name = "scan next", .usage = "scan next --cond C [--value V] [--value2 V] [--encoding E] [--tol X] [--timeout MS]", .desc = "Filter previous results. Conds: exact, greater, less, between, changed, unchanged, increased, decreased. For string and bytes only exact, changed and unchanged are supported." },
+    .{ .name = "scan list", .usage = "scan list [--offset N] [--limit N]", .desc = "Show results with current and previous values (limit <= 10000, default 50). String values are JSON strings; bytes values are hex strings." },
     .{ .name = "scan status", .usage = "scan status", .desc = "Scan state: count, type, truncated flag." },
     .{ .name = "scan reset", .usage = "scan reset", .desc = "Discard scan results." },
     .{ .name = "freeze", .usage = "freeze --addr A --value V [--type T] [--offsets ...] [--for MS] [--interval MS] [--timeout MS]", .desc = "Keep writing a value for the given time (blocking). Ctrl+C stops early; --timeout MS caps the duration." },
@@ -654,8 +731,9 @@ const help_notes = [_][]const u8{
     "Every response is a single JSON object on one line: {\"ok\":true,...} or {\"ok\":false,\"error\":{\"code\":...,\"message\":...}}.",
     "Exit codes: 0 success, 1 runtime error, 2 usage error.",
     "Addresses are strings like \"0x00007FF6A1B2C3D4\". Input accepts hex (0x..), decimal, or module+offset (game.exe+0x1A2B3C).",
-    "Types: int8, int16, int32, int64, uint8, uint16, uint32, uint64, float32, float64. Float 'exact' matches with rounding tolerance derived from the typed digits (use --tol 0 for bit-exact).",
+    "Types: int8, int16, int32, int64, uint8, uint16, uint32, uint64, float32, float64, string, bytes. Float 'exact' matches with rounding tolerance derived from the typed digits (use --tol 0 for bit-exact).",
     "Integer values accept decimal, hex (0x..), octal (0o..), and binary (0b..) literals; --addr accepts 0x.., decimal, or module+offset.",
+    "String scans match the bytes of --value, encoded as --encoding utf8 (default) or utf16le. Bytes scans take a hex pattern such as \"48 8B ?? ?? 89\", where ?? matches any byte. Patterns are limited to 256 bytes and scanned on every byte offset.",
     "One-shot mode keeps scan state in %TEMP%\\memfract\\<session>.session (--session NAME, default 'default'; --no-session disables). Use 'serve' for many commands without disk I/O.",
     "Typical flow: ps -> attach -> scan first -> (change value in target) -> scan next -> scan list -> table add -> write/freeze.",
     "Run as Administrator to open most processes. Not for use against online games or protected processes.",
@@ -747,8 +825,8 @@ fn cmdDetach(s: *Session, w: *json.Writer) !void {
     s.proc = null;
     s.pid = 0;
     s.ctime = 0;
-    s.sc.matches.clearAndFree(gpa);
-    s.sc.truncated = false;
+    s.sc.deinit(gpa);
+    s.sc = .{};
     s.scanned = false;
     s.dirty = true;
     try w.kvBool("detached", true);
@@ -771,7 +849,7 @@ fn cmdRead(a: std.mem.Allocator, s: *Session, args: Args, w: *json.Writer) !void
         return;
     }
 
-    const kind = try kindArg(args);
+    const kind = try fixedKindArg(args);
     const sz = kind.size();
     var raw: [8]u8 = undefined;
     p.read(addr, raw[0..sz]) catch return fail(error.ReadFailed, "cannot read memory at 0x{X}", .{addr});
@@ -784,7 +862,7 @@ fn cmdRead(a: std.mem.Allocator, s: *Session, args: Args, w: *json.Writer) !void
 fn cmdWrite(a: std.mem.Allocator, s: *Session, args: Args, w: *json.Writer) !void {
     const p = try getProc(a, s, args);
     const addr = try resolveAddr(a, s, p, args);
-    const kind = try kindArg(args);
+    const kind = try fixedKindArg(args);
     const vt = args.opt("--value") orelse return fail(error.BadArgs, "missing --value", .{});
     const val = try encodeArg(kind, vt, "--value");
     const sz = kind.size();
@@ -822,7 +900,7 @@ fn cmdScan(a: std.mem.Allocator, s: *Session, args: Args, w: *json.Writer) !void
             .exact, .greater, .less, .between, .unknown => {},
             else => return fail(error.BadArgs, "cond '{s}' is only valid for 'scan next'", .{@tagName(mode)}),
         }
-        const cond = try buildCond(kind, mode, args);
+        const cond = try buildCond(kind, mode, .utf8, args);
         const range = try scanRange(a, s, args);
         const alignment = try alignmentArg(args, kind);
         const timeout = try timeoutArg(args);
@@ -836,6 +914,8 @@ fn cmdScan(a: std.mem.Allocator, s: *Session, args: Args, w: *json.Writer) !void
                 if (interrupted.load(.acquire)) return fail(error.Canceled, "scan canceled by Ctrl+C", .{});
                 return fail(error.Timeout, "scan stopped by --timeout {d} ms; narrow the scan or raise the timeout", .{timeout});
             }
+            if (e == error.MissingPattern) return fail(error.BadArgs, "type {s} needs --value as the pattern", .{@tagName(kind)});
+            if (e == error.PatternTooLong) return fail(error.BadArgs, "--value is longer than {d} bytes", .{scan.max_value_len});
             return e;
         };
         s.scanned = true;
@@ -846,7 +926,7 @@ fn cmdScan(a: std.mem.Allocator, s: *Session, args: Args, w: *json.Writer) !void
         if (!s.scanned) return fail(error.NoScan, "no previous scan: run 'scan first' first", .{});
         const mode = try modeArg(args, .exact);
         if (mode == .unknown) return fail(error.BadArgs, "cond 'unknown' is only valid for 'scan first'", .{});
-        const cond = try buildCond(s.sc.kind, mode, args);
+        const cond = try buildCond(s.sc.kind, mode, s.sc.encoding, args);
         const timeout = try timeoutArg(args);
 
         startWatchdog(timeout);
@@ -866,11 +946,12 @@ fn cmdScan(a: std.mem.Allocator, s: *Session, args: Args, w: *json.Writer) !void
         const items = s.sc.matches.items;
         const end = @min(items.len, offset +| limit);
         const kind = s.sc.kind;
-        const sz = kind.size();
+        const step = s.sc.valueLen();
 
         try w.kvInt("count", items.len);
         try w.kvInt("offset", offset);
         try w.kvStr("type", @tagName(kind));
+        if (kind == .string) try w.kvStr("encoding", @tagName(s.sc.encoding));
         try w.key("results");
         try w.arrayBegin();
         var ab: [24]u8 = undefined;
@@ -881,14 +962,14 @@ fn cmdScan(a: std.mem.Allocator, s: *Session, args: Args, w: *json.Writer) !void
             try w.kvInt("index", i);
             try w.kvStr("address", hexAddr(&ab, m.addr));
             try w.key("value");
-            var cur: [8]u8 = undefined;
-            if (p != null and (p.?.read(m.addr, cur[0..sz]) catch null) != null) {
-                try emitValue(w, kind, cur[0..sz]);
+            var cur: [scan.max_value_len]u8 = undefined;
+            if (p != null and (p.?.read(m.addr, cur[0..step]) catch null) != null) {
+                try emitValueAny(w, kind, s.sc.encoding, cur[0..step]);
             } else {
                 try w.nullv();
             }
             try w.key("previous");
-            try emitValue(w, kind, m.old[0..sz]);
+            try emitValueAny(w, kind, s.sc.encoding, s.sc.valueAt(i));
             try w.objectEnd();
         }
         try w.arrayEnd();
@@ -899,8 +980,8 @@ fn cmdScan(a: std.mem.Allocator, s: *Session, args: Args, w: *json.Writer) !void
         try w.kvInt("count", s.sc.matches.items.len);
         try w.kvBool("truncated", s.sc.truncated);
     } else if (std.mem.eql(u8, sub, "reset")) {
-        s.sc.matches.clearAndFree(gpa);
-        s.sc.truncated = false;
+        s.sc.deinit(gpa);
+        s.sc = .{};
         s.scanned = false;
         s.dirty = true;
         try w.kvBool("reset", true);
@@ -912,7 +993,7 @@ fn cmdScan(a: std.mem.Allocator, s: *Session, args: Args, w: *json.Writer) !void
 fn cmdFreeze(a: std.mem.Allocator, s: *Session, args: Args, w: *json.Writer) !void {
     const p = try getProc(a, s, args);
     const addr = try resolveAddr(a, s, p, args);
-    const kind = try kindArg(args);
+    const kind = try fixedKindArg(args);
     const vt = args.opt("--value") orelse return fail(error.BadArgs, "missing --value", .{});
     const val = try encodeArg(kind, vt, "--value");
     const dur: u64 = if (args.opt("--for")) |t| try parseU64(t) else 1000;
@@ -947,7 +1028,7 @@ fn cmdFreeze(a: std.mem.Allocator, s: *Session, args: Args, w: *json.Writer) !vo
 fn cmdWatch(a: std.mem.Allocator, s: *Session, args: Args, w: *json.Writer) !void {
     const p = try getProc(a, s, args);
     const addr = try resolveAddr(a, s, p, args);
-    const kind = try kindArg(args);
+    const kind = try fixedKindArg(args);
     const sz = kind.size();
     const interval: u32 = if (args.opt("--interval")) |t| try parseU32(t) else 100;
     const count: u64 = if (args.opt("--count")) |t| try parseU64(t) else 20;
@@ -1009,10 +1090,12 @@ fn cmdTable(a: std.mem.Allocator, s: *Session, args: Args, w: *json.Writer) !voi
             if (!s.scanned or idx >= s.sc.matches.items.len) return fail(error.NotFound, "no scan result with index {d}", .{idx});
             addr = s.sc.matches.items[idx].addr;
             kind = s.sc.kind;
+            if (kind.isVariable())
+                return fail(error.BadArgs, "the table does not support type {s}; use 'scan list' instead", .{@tagName(kind)});
         } else {
             const p = try getProc(a, s, args);
             addr = try resolveAddr(a, s, p, args);
-            kind = try kindArg(args);
+            kind = try fixedKindArg(args);
         }
         const raw_desc = util.clipUtf8(args.opt("--desc") orelse "", 120);
         const d = try gpa.dupe(u8, util.cleanUtf8(raw_desc));
@@ -1092,6 +1175,7 @@ fn cmdTable(a: std.mem.Allocator, s: *Session, args: Args, w: *json.Writer) !voi
         var lines = std.mem.splitScalar(u8, data, '\n');
         while (lines.next()) |raw| {
             const parsed = util.parseTableLine(raw) orelse continue;
+            if (parsed.kind.isVariable()) continue;
             const d = try gpa.dupe(u8, util.clipUtf8(util.cleanUtf8(parsed.desc), 120));
             try s.table.append(gpa, .{ .addr = parsed.addr, .kind = parsed.kind, .desc = d });
         }
@@ -1354,20 +1438,22 @@ test "session roundtrip keeps matches and table" {
     s.scanned = true;
     s.sc.truncated = true;
 
-    var m1: scan.Match = .{ .addr = 0x1000, .old = std.mem.zeroes([8]u8) };
-    std.mem.writeInt(i32, m1.old[0..4], 100, .little);
-    var m2: scan.Match = .{ .addr = 0x2000, .old = std.mem.zeroes([8]u8) };
-    std.mem.writeInt(i32, m2.old[0..4], -5, .little);
-    try s.sc.matches.append(gpa, m1);
-    try s.sc.matches.append(gpa, m2);
+    var v1: [4]u8 = undefined;
+    std.mem.writeInt(i32, &v1, 100, .little);
+    var v2: [4]u8 = undefined;
+    std.mem.writeInt(i32, &v2, -5, .little);
+    try s.sc.matches.append(gpa, .{ .addr = 0x1000 });
+    try s.sc.matches.append(gpa, .{ .addr = 0x2000 });
+    try s.sc.values.appendSlice(gpa, &v1);
+    try s.sc.values.appendSlice(gpa, &v2);
     try s.table.append(gpa, .{ .addr = 0x3000, .kind = .float64, .desc = try gpa.dupe(u8, "health") });
 
     const data = try encodeSession(a, &s);
     defer a.free(data);
 
-    try std.testing.expectEqualStrings("ZCS3", data[0..4]);
+    try std.testing.expectEqualStrings("ZCS4", data[0..4]);
     // header 28 + 2 int32 records of 12 bytes + rows count 4 + row 17
-    try std.testing.expectEqual(@as(usize, 73), data.len);
+    try std.testing.expectEqual(@as(usize, 81), data.len);
 
     var t: Session = .{ .name = "roundtrip" };
     defer freeSession(&t);
@@ -1380,8 +1466,8 @@ test "session roundtrip keeps matches and table" {
     try std.testing.expect(t.sc.truncated);
     try std.testing.expectEqual(@as(usize, 2), t.sc.matches.items.len);
     try std.testing.expectEqual(@as(usize, 0x1000), t.sc.matches.items[0].addr);
-    try std.testing.expectEqual(@as(i32, 100), std.mem.readInt(i32, t.sc.matches.items[0].old[0..4], .little));
-    try std.testing.expectEqual(@as(i32, -5), std.mem.readInt(i32, t.sc.matches.items[1].old[0..4], .little));
+    try std.testing.expectEqual(@as(i32, 100), std.mem.readInt(i32, t.sc.valueAt(0)[0..4], .little));
+    try std.testing.expectEqual(@as(i32, -5), std.mem.readInt(i32, t.sc.valueAt(1)[0..4], .little));
     try std.testing.expectEqual(@as(usize, 1), t.table.items.len);
     try std.testing.expectEqual(@as(u64, 0x3000), t.table.items[0].addr);
     try std.testing.expectEqual(scan.Kind.float64, t.table.items[0].kind);
@@ -1393,8 +1479,8 @@ test "decodeSession rejects truncated data" {
     var s: Session = .{ .name = "truncated" };
     defer freeSession(&s);
     s.sc.kind = .int64;
-    const m: scan.Match = .{ .addr = 0x5000, .old = std.mem.zeroes([8]u8) };
-    try s.sc.matches.append(gpa, m);
+    try s.sc.matches.append(gpa, .{ .addr = 0x5000 });
+    try s.sc.values.appendSlice(gpa, &std.mem.zeroes([8]u8));
     const data = try encodeSession(a, &s);
     defer a.free(data);
 
@@ -1449,5 +1535,71 @@ test "decodeSession accepts legacy ZCS2 records" {
     try decodeSession(buf.items, &t);
     try std.testing.expectEqual(@as(u32, 7), t.pid);
     try std.testing.expectEqual(@as(usize, 1), t.sc.matches.items.len);
-    try std.testing.expectEqual(@as(i32, 77), std.mem.readInt(i32, t.sc.matches.items[0].old[0..4], .little));
+    try std.testing.expectEqual(@as(i32, 77), std.mem.readInt(i32, t.sc.valueAt(0)[0..4], .little));
+}
+
+test "decodeSession accepts ZCS3 records" {
+    const a = std.testing.allocator;
+    var buf: std.ArrayList(u8) = .empty;
+    defer buf.deinit(a);
+    try buf.appendSlice(a, "ZCS3");
+    try putInt(a, &buf, u32, 11);
+    try putInt(a, &buf, u64, 12);
+    try buf.append(a, @backingInt(scan.Kind.int32));
+    try buf.append(a, 1);
+    try buf.append(a, 0);
+    try buf.append(a, 0);
+    try putInt(a, &buf, u64, 1);
+    try putInt(a, &buf, u64, 0x6000);
+    var v: [4]u8 = undefined;
+    std.mem.writeInt(i32, &v, 77, .little);
+    try buf.appendSlice(a, &v);
+    try putInt(a, &buf, u32, 0);
+
+    var t: Session = .{ .name = "v3" };
+    defer freeSession(&t);
+    try decodeSession(buf.items, &t);
+    try std.testing.expectEqual(scan.Kind.int32, t.sc.kind);
+    try std.testing.expectEqual(@as(i32, 77), std.mem.readInt(i32, t.sc.valueAt(0)[0..4], .little));
+}
+
+test "session roundtrip keeps string scans" {
+    const a = std.testing.allocator;
+    var s: Session = .{ .name = "strings" };
+    defer freeSession(&s);
+    s.sc.kind = .string;
+    s.sc.encoding = .utf16le;
+    s.sc.value_len = 6;
+    try s.sc.matches.append(gpa, .{ .addr = 0x6000 });
+    try s.sc.values.appendSlice(gpa, "h\x00i\x00!\x00");
+
+    const data = try encodeSession(a, &s);
+    defer a.free(data);
+    try std.testing.expectEqualStrings("ZCS4", data[0..4]);
+
+    var t: Session = .{ .name = "strings" };
+    defer freeSession(&t);
+    try decodeSession(data, &t);
+    try std.testing.expectEqual(scan.Kind.string, t.sc.kind);
+    try std.testing.expectEqual(scan.Encoding.utf16le, t.sc.encoding);
+    try std.testing.expectEqualStrings("h\x00i\x00!\x00", t.sc.valueAt(0));
+}
+
+test "buildCond parses binary patterns" {
+    const bytes_argv = [_][]const u8{ "scan", "first", "--type", "bytes", "--value", "48 8b ?? ?? 89" };
+    const bc = try buildCond(.bytes, .exact, .utf8, .{ .v = &bytes_argv });
+    try std.testing.expectEqual(@as(usize, 5), bc.pattern_len);
+    try std.testing.expectEqualStrings("\x48\x8b\x00\x00\x89", bc.patternSlice());
+    try std.testing.expectEqualStrings("\x01\x01\x00\x00\x01", bc.maskSlice());
+
+    const str_argv = [_][]const u8{ "scan", "first", "--type", "string", "--value", "hi", "--encoding", "utf16le" };
+    const sc_cond = try buildCond(.string, .exact, .utf8, .{ .v = &str_argv });
+    try std.testing.expectEqual(scan.Encoding.utf16le, sc_cond.encoding);
+    try std.testing.expectEqualStrings("h\x00i\x00", sc_cond.patternSlice());
+
+    const bad_argv = [_][]const u8{ "scan", "first", "--type", "bytes", "--value", "48 zz" };
+    try std.testing.expectError(error.BadArgs, buildCond(.bytes, .exact, .utf8, .{ .v = &bad_argv }));
+
+    const mode_argv = [_][]const u8{ "scan", "next", "--cond", "greater", "--value", "1" };
+    try std.testing.expectError(error.BadArgs, buildCond(.string, .greater, .utf8, .{ .v = &mode_argv }));
 }

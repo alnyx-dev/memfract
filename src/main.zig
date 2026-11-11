@@ -60,13 +60,13 @@ fn exec(gpa: std.mem.Allocator, st: *State, line: []const u8) !bool {
         const p = try win.Process.open(pid);
         if (st.proc) |old| old.close();
         st.proc = p;
-        st.sc.matches.clearRetainingCapacity();
+        st.sc.reset();
         std.debug.print("attached to PID {d}\n", .{pid});
     } else if (eql(u8, cmd, "scan")) {
         const proc = st.proc orelse return error.NotAttached;
         const kind = scan.Kind.parse(it.next() orelse return error.MissingArgument) orelse return error.UnknownType;
         const val = try scan.encode(kind, it.next() orelse return error.MissingArgument);
-        try st.sc.first(gpa, proc, kind, .{ .mode = .exact, .a = val }, false, .{});
+        try st.sc.first(gpa, proc, kind, .{ .mode = .exact, .a = val }, false, .{}, kind.size());
         std.debug.print("found: {d}\n", .{st.sc.matches.items.len});
     } else if (eql(u8, cmd, "next")) {
         const proc = st.proc orelse return error.NotAttached;
@@ -82,17 +82,17 @@ fn exec(gpa: std.mem.Allocator, st: *State, line: []const u8) !bool {
         const proc = st.proc orelse return error.NotAttached;
         const limit = if (it.next()) |s| try std.fmt.parseInt(usize, s, 10) else 20;
         const kind = st.sc.kind;
-        const sz = kind.size();
+        const sz = st.sc.valueLen();
         const n = @min(st.sc.matches.items.len, limit);
         for (st.sc.matches.items[0..n], 0..) |m, i| {
-            var cur: [8]u8 = undefined;
+            var cur: [scan.max_value_len]u8 = undefined;
+            var vb: [96]u8 = undefined;
             std.debug.print("[{d}] 0x{x:0>12}  ", .{ i, m.addr });
             proc.read(m.addr, cur[0..sz]) catch {
                 std.debug.print("??\n", .{});
                 continue;
             };
-            scan.show(kind, cur[0..sz]);
-            std.debug.print("\n", .{});
+            std.debug.print("{s}\n", .{scan.fmtValueAny(kind, st.sc.encoding, cur[0..sz], &vb)});
         }
         std.debug.print("total: {d}\n", .{st.sc.matches.items.len});
     } else if (eql(u8, cmd, "set")) {

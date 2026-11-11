@@ -903,7 +903,7 @@ fn drawListItem(di: *const DRAWITEMSTRUCT) void {
             res_cache_text[slot][0..res_cache_len[slot]]
         else
             "...";
-        const prev_s = scan.fmtValue(sc.kind, m.old[0..sc.kind.size()], &pv);
+        const prev_s = scan.fmtValueAny(sc.kind, sc.encoding, sc.valueAt(idx), &pv);
         const changed = !std.mem.eql(u8, cur_s, prev_s);
         text(hdc, f_semi, if (changed) pal.accent else pal.text, cur_s, val_x, rc.top, val_w, h, DT_V);
         text(hdc, f_body, pal.text2, prev_s, prev_x, rc.top, rc.right - S(4) - prev_x, h, DT_V);
@@ -1342,15 +1342,15 @@ fn refreshResultsValues() void {
     if (visible > total - top) visible = total - top;
 
     const kind = sc.kind;
-    const sz = kind.size();
+    const sz = sc.valueLen();
     var i: usize = 0;
     while (i < visible) : (i += 1) {
         const idx = top + i;
         const slot = idx % cache_cap;
-        var cur: [8]u8 = undefined;
+        var cur: [scan.max_value_len]u8 = undefined;
         var vb: [48]u8 = undefined;
         res_cache_idx[slot] = idx;
-        const value_text: []const u8 = if (p.read(sc.matches.items[idx].addr, cur[0..sz])) |_| scan.fmtValue(kind, cur[0..sz], &vb) else |_| "??";
+        const value_text: []const u8 = if (p.read(sc.matches.items[idx].addr, cur[0..sz])) |_| scan.fmtValueAny(kind, sc.encoding, cur[0..sz], &vb) else |_| "??";
         @memcpy(res_cache_text[slot][0..value_text.len], value_text);
         res_cache_len[slot] = value_text.len;
         res_cache_filled[slot] = true;
@@ -1392,8 +1392,8 @@ fn attach() void {
     scan_active = false;
     for (table.items) |*row| row.frozen = false;
     syncFreezeTimer();
-    sc.matches.clearAndFree(gpa);
-    sc.truncated = false;
+    sc.deinit(gpa);
+    sc = .{};
     clearResultsCache();
 
     const lbl = std.fmt.bufPrint(&proc_label, "{s} · {d}", .{ util.clipUtf8(e.name[0..e.name_len], 40), e.pid }) catch proc_label[0..0];
@@ -1539,8 +1539,8 @@ fn onScanDone() void {
 
 fn doReset() void {
     scan_active = false;
-    sc.matches.clearAndFree(gpa);
-    sc.truncated = false;
+    sc.deinit(gpa);
+    sc = .{};
     clearResultsCache();
     updateResults();
     setStatus("Results cleared — you can start a new scan", .{});
