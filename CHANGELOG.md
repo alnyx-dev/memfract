@@ -5,6 +5,22 @@ and versions follow the `DEPTH.ITERATION` scheme described in `AGENTS.md`.
 
 ## [Unreleased]
 
+## [1.3] — 2026-11-11
+
+### Added
+
+- `uint8`, `uint16`, `uint32`, and `uint64` value types for scans, read/write, and the
+  address table.
+- `scan first --align N` sets the address alignment (a power of two, default the value
+  size). `--align 1` finds values at arbitrary, unaligned addresses.
+- Integer `--value` accepts hex (`0x..`), octal, and binary literals in scans, writes,
+  `freeze`, and table writes.
+
+### Changed
+
+- Unaligned scans read across chunk and page boundaries so values that straddle them are
+  not missed. Session files stay `ZCS3`: existing type ids are unchanged.
+
 ## [1.2] — 2026-11-11
 
 ### Fixed
