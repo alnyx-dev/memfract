@@ -190,7 +190,9 @@ Tests must not hardcode the version string; compare against `version.zig`.
 Releasing:
 
 1. Update the version in the places above and add a section to `CHANGELOG.md`.
-2. `zig build test` and `zig build smoke` must pass.
+2. `zig build test` and `zig build smoke` must pass. Release binaries are built with
+   `-Dcpu=baseline`; without it the runner's CPU features end up in the binary and it
+   crashes on older machines.
 3. Commit (`chore: release v2.1`), then
    `gh release create v2.1 --repo alnyx-dev/memfract --title "v2.1" --notes-file <notes>`.
 4. Release notes list changes one per line, prefixed `feat:`, `fix:` or `perf:`.

@@ -61,7 +61,7 @@ jobs:
 
       - name: Build
         if: env.TAG != ''
-        run: zig build --release=safe
+        run: zig build --release=safe -Dcpu=baseline
 
       - name: Create tag
         if: env.TAG != '' && env.TAG_EXISTS == 'false'
