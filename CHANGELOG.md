@@ -5,6 +5,13 @@ and versions follow the `DEPTH.ITERATION` scheme described in `AGENTS.md`.
 
 ## [Unreleased]
 
+## [1.1] — 2026-11-11
+
+### Added
+
+- `int8` and `int16` value types for scans, read/write, and the address table.
+- `scan first --module NAME`, `--start A`, and `--end A` to limit a scan to a module or an address range.
+
 ## [1.0] — 2026-11-11
 
 First release.
