@@ -1,0 +1,96 @@
+name: Release
+
+on:
+  push:
+    branches:
+      - main
+  workflow_dispatch:
+
+permissions:
+  contents: write
+
+jobs:
+  release:
+    runs-on: windows-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - uses: mlugg/setup-zig@v2
+        with:
+          version: 0.17.0
+
+      - name: Resolve version
+        shell: pwsh
+        env:
+          GH_TOKEN: ${{ github.token }}
+          REPO: ${{ github.repository }}
+        run: |
+          $ErrorActionPreference = 'Stop'
+          $match = Select-String -Path src/version.zig -Pattern 'pub const string = "([^"]+)"'
+          if (-not $match) { throw 'cannot read the version from src/version.zig' }
+          $version = $match.Matches[0].Groups[1].Value
+          $tag = "v$version"
+
+          git fetch --tags --force
+          $tagExists = [bool](git ls-remote --tags origin "refs/tags/$tag")
+          gh release view $tag --repo $env:REPO *> $null
+          if ($tagExists -and $LASTEXITCODE -eq 0) {
+            Write-Host "Release $tag already exists; nothing to do."
+            exit 0
+          }
+
+          if ($tagExists) { git checkout $tag }
+
+          "TAG=$tag" | Out-File -FilePath $env:GITHUB_ENV -Append -Encoding utf8
+          "TAG_EXISTS=$($tagExists.ToString().ToLower())" | Out-File -FilePath $env:GITHUB_ENV -Append -Encoding utf8
+
+      - name: Test
+        if: env.TAG != ''
+        run: zig build test
+
+      - name: Build
+        if: env.TAG != ''
+        run: zig build --release=safe
+
+      - name: Create tag
+        if: env.TAG != '' && env.TAG_EXISTS == 'false'
+        shell: pwsh
+        run: |
+          $ErrorActionPreference = 'Stop'
+          git tag $env:TAG
+          git push origin "refs/tags/$env:TAG"
+
+      - name: Publish
+        if: env.TAG != ''
+        shell: pwsh
+        env:
+          GH_TOKEN: ${{ github.token }}
+          REPO: ${{ github.repository }}
+        run: |
+          $ErrorActionPreference = 'Stop'
+          $notesFile = Join-Path $env:RUNNER_TEMP 'notes.md'
+
+          git fetch --tags --force
+          $prev = git describe --tags --abbrev=0 "$env:TAG^" 2>$null
+          $range = if ($LASTEXITCODE -eq 0 -and $prev) { "$prev..$env:TAG" } else { $env:TAG }
+
+          $breaking = @()
+          $changes = @()
+          foreach ($subject in (git log --format=%s $range)) {
+            if ($subject -match '^(feat|fix|perf)(\([^)]*\))?!: ') {
+              $breaking += "BREAKING: $subject"
+            } elseif ($subject -match '^(feat|fix|perf)(\([^)]*\))?: ') {
+              $changes += $subject
+            }
+          }
+
+          $lines = @($breaking) + @($changes)
+          if ($lines.Count -eq 0) { $lines = @("Release $env:TAG") }
+          $lines | Set-Content -Path $notesFile -Encoding utf8
+
+          $flags = @()
+          if ($env:TAG -match '-') { $flags += '--prerelease' }
+
+          gh release create $env:TAG --repo $env:REPO --title $env:TAG --notes-file $notesFile --verify-tag @flags zig-out/bin/memfract.exe zig-out/bin/memfract-gui.exe
