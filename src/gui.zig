@@ -436,7 +436,12 @@ const PopupKind = enum { none, type, cond, menu };
 
 const first_modes = [_]scan.Mode{ .exact, .greater, .less, .between, .unknown };
 const next_modes = [_]scan.Mode{ .exact, .greater, .less, .between, .changed, .unchanged, .increased, .decreased };
-const type_names = [_][]const u8{ "int32", "int64", "float32", "float64" };
+const type_kinds = [_]scan.Kind{ .int8, .int16, .int32, .int64, .float32, .float64 };
+const type_names = [_][]const u8{ "int8", "int16", "int32", "int64", "float32", "float64" };
+
+fn kindIndex(kind: scan.Kind) usize {
+    return std.mem.indexOfScalar(scan.Kind, &type_kinds, kind) orelse 0;
+}
 
 const Ui = struct {
     pill: HWND,
@@ -491,7 +496,7 @@ var main_wnd: HWND = undefined;
 var hinst: HINSTANCE = undefined;
 var focused_id: usize = 0;
 var picker: bool = false;
-var kind_sel: usize = 0;
+var kind_sel: usize = 2;
 var cond_mode: scan.Mode = .exact;
 var writable_only: bool = true;
 var scan_active: bool = false;
@@ -1140,7 +1145,7 @@ fn relayout() void {
 
 fn refreshLabels() void {
     normalizeCond();
-    const kind: scan.Kind = if (scan_active) sc.kind else @fromBackingInt(@intCast(kind_sel));
+    const kind: scan.Kind = if (scan_active) sc.kind else type_kinds[kind_sel];
     var b: [64]u8 = undefined;
     setText(ui.dd_type, std.fmt.bufPrint(&b, "{s}  ▾", .{@tagName(kind)}) catch "");
     setText(ui.dd_cond, std.fmt.bufPrint(&b, "{s}  ▾", .{condLabel(cond_mode)}) catch "");
@@ -1192,7 +1197,7 @@ fn openPopup(kind: PopupKind) void {
         .none => return,
         .type => {
             anchor = b_dd_type;
-            const cur: usize = if (scan_active) @backingInt(sc.kind) else kind_sel;
+            const cur: usize = if (scan_active) kindIndex(sc.kind) else kind_sel;
             for (type_names, 0..) |nm, i| popup_items[i] = nm;
             popup_n = type_names.len;
             popup_cur = cur;
@@ -1405,7 +1410,7 @@ fn attach() void {
 
 fn scanThread(_: ?*anyopaque) callconv(.winapi) u32 {
     if (job.first) {
-        sc.first(gpa, job.p, job.kind, job.cond, job.writable) catch |e| {
+        sc.first(gpa, job.p, job.kind, job.cond, job.writable, .{}) catch |e| {
             job.err = @errorName(e);
         };
     } else {
@@ -1457,7 +1462,7 @@ fn doScan(first: bool) void {
         return;
     }
 
-    const kind: scan.Kind = if (first) @fromBackingInt(@intCast(kind_sel)) else sc.kind;
+    const kind: scan.Kind = if (first) type_kinds[kind_sel] else sc.kind;
     const sz = kind.size();
     var cond: scan.Cond = .{ .mode = mode };
 

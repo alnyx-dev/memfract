@@ -6,7 +6,7 @@ const help_text =
     \\Commands:
     \\  ps [filter]              list processes
     \\  attach <pid>             attach to a process
-    \\  scan <type> <value>      first scan (types: int32 int64 float32 float64)
+    \\  scan <type> <value>      first scan (types: int8 int16 int32 int64 float32 float64)
     \\  next <value>             keep addresses with the new exact value
     \\  changed                  keep addresses whose value changed
     \\  unchanged                keep addresses whose value did not change
@@ -66,7 +66,7 @@ fn exec(gpa: std.mem.Allocator, st: *State, line: []const u8) !bool {
         const proc = st.proc orelse return error.NotAttached;
         const kind = scan.Kind.parse(it.next() orelse return error.MissingArgument) orelse return error.UnknownType;
         const val = try scan.encode(kind, it.next() orelse return error.MissingArgument);
-        try st.sc.first(gpa, proc, kind, .{ .mode = .exact, .a = val }, false);
+        try st.sc.first(gpa, proc, kind, .{ .mode = .exact, .a = val }, false, .{});
         std.debug.print("found: {d}\n", .{st.sc.matches.items.len});
     } else if (eql(u8, cmd, "next")) {
         const proc = st.proc orelse return error.NotAttached;

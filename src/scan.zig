@@ -6,9 +6,13 @@ pub const Kind = enum {
     int64,
     float32,
     float64,
+    int8,
+    int16,
 
     pub fn size(k: Kind) usize {
         return switch (k) {
+            .int8 => 1,
+            .int16 => 2,
             .int32, .float32 => 4,
             .int64, .float64 => 8,
         };
@@ -30,6 +34,8 @@ pub const Value = struct {
 pub fn encode(kind: Kind, text: []const u8) !Value {
     var v: Value = .{};
     switch (kind) {
+        .int8 => std.mem.writeInt(i8, v.bytes[0..1], try std.fmt.parseInt(i8, text, 10), .little),
+        .int16 => std.mem.writeInt(i16, v.bytes[0..2], try std.fmt.parseInt(i16, text, 10), .little),
         .int32 => std.mem.writeInt(i32, v.bytes[0..4], try std.fmt.parseInt(i32, text, 10), .little),
         .int64 => std.mem.writeInt(i64, v.bytes[0..8], try std.fmt.parseInt(i64, text, 10), .little),
         .float32 => {
@@ -51,6 +57,8 @@ pub fn show(kind: Kind, b: []const u8) void {
 
 pub fn fmtValue(kind: Kind, b: []const u8, buf: []u8) []const u8 {
     const r = switch (kind) {
+        .int8 => std.fmt.bufPrint(buf, "{d}", .{std.mem.readInt(i8, b[0..1], .little)}),
+        .int16 => std.fmt.bufPrint(buf, "{d}", .{std.mem.readInt(i16, b[0..2], .little)}),
         .int32 => std.fmt.bufPrint(buf, "{d}", .{std.mem.readInt(i32, b[0..4], .little)}),
         .int64 => std.fmt.bufPrint(buf, "{d}", .{std.mem.readInt(i64, b[0..8], .little)}),
         .float32 => std.fmt.bufPrint(buf, "{d}", .{@as(f32, @bitCast(std.mem.readInt(u32, b[0..4], .little)))}),
@@ -75,6 +83,8 @@ fn asF64(kind: Kind, b: []const u8) f64 {
 
 pub fn cmpVal(kind: Kind, x: []const u8, y: []const u8) ?std.math.Order {
     switch (kind) {
+        .int8 => return std.math.order(std.mem.readInt(i8, x[0..1], .little), std.mem.readInt(i8, y[0..1], .little)),
+        .int16 => return std.math.order(std.mem.readInt(i16, x[0..2], .little), std.mem.readInt(i16, y[0..2], .little)),
         .int32 => return std.math.order(std.mem.readInt(i32, x[0..4], .little), std.mem.readInt(i32, y[0..4], .little)),
         .int64 => return std.math.order(std.mem.readInt(i64, x[0..8], .little), std.mem.readInt(i64, y[0..8], .little)),
         .float32, .float64 => {
@@ -152,6 +162,25 @@ pub const Match = struct {
 pub var progress = std.atomic.Value(u32).init(0);
 pub var cancel_flag = std.atomic.Value(bool).init(false);
 
+pub const Range = struct {
+    start: usize = 0,
+    end: usize = std.math.maxInt(usize),
+};
+
+const Span = struct { off: usize, len: usize };
+
+fn regionSpan(range: Range, base: usize, size: usize, step: usize) ?Span {
+    const end, const overflow = @addWithOverflow(base, size);
+    if (overflow != 0) return null;
+    if (end <= range.start or base >= range.end) return null;
+    const lo = @max(base, range.start);
+    const hi = @min(end, range.end);
+    const off = std.mem.alignForward(usize, lo - base, step);
+    const stop = hi - base;
+    if (off >= stop) return null;
+    return .{ .off = off, .len = @min(size - off, stop - off + step - 1) };
+}
+
 pub const Scanner = struct {
     kind: Kind = .int32,
     matches: std.ArrayList(Match) = .empty,
@@ -172,6 +201,7 @@ pub const Scanner = struct {
         kind: Kind,
         cond: Cond,
         writable_only: bool,
+        range: Range,
     ) !void {
         self.kind = kind;
         self.matches.clearRetainingCapacity();
@@ -182,20 +212,24 @@ pub const Scanner = struct {
         defer regs.deinit(gpa);
 
         var total: u64 = 1;
-        for (regs.items) |r| total += r.size;
+        for (regs.items) |r| {
+            if (regionSpan(range, r.base, r.size, kind.size())) |s| total += s.len;
+        }
         var done: u64 = 0;
 
         const buf = try gpa.alloc(u8, chunk_size);
         defer gpa.free(buf);
 
         outer: for (regs.items) |r| {
-            var off: usize = 0;
-            while (off < r.size) : (off += chunk_size) {
+            const span = regionSpan(range, r.base, r.size, kind.size()) orelse continue;
+            var off = span.off;
+            const stop = span.off + span.len;
+            while (off < stop) : (off += chunk_size) {
                 if (cancel_flag.load(.acquire)) {
                     self.matches.clearRetainingCapacity();
                     return error.Canceled;
                 }
-                const n = @min(chunk_size, r.size - off);
+                const n = @min(chunk_size, stop - off);
                 done += n;
                 progress.store(@intCast(done * 1000 / total), .release);
 
@@ -224,6 +258,8 @@ pub const Scanner = struct {
     ) !bool {
         if (cond.mode == .exact and !kind.isFloat()) {
             return switch (kind) {
+                .int8 => self.scanExact(gpa, i8, buf, base, std.mem.readInt(i8, cond.a.bytes[0..1], .little)),
+                .int16 => self.scanExact(gpa, i16, buf, base, std.mem.readInt(i16, cond.a.bytes[0..2], .little)),
                 .int32 => self.scanExact(gpa, i32, buf, base, std.mem.readInt(i32, cond.a.bytes[0..4], .little)),
                 .int64 => self.scanExact(gpa, i64, buf, base, std.mem.readInt(i64, cond.a.bytes[0..8], .little)),
                 else => unreachable,
@@ -428,6 +464,38 @@ test "all scan conditions" {
     try std.testing.expect(check(.int32, cs, os, &c));
     c = .{ .mode = .between, .a = v20, .b = v10 };
     try std.testing.expect(!check(.int32, cs, os, &c));
+}
+
+test "int8 and int16 roundtrip, format, and compare" {
+    const small = try encode(.int8, "-128");
+    try std.testing.expectEqual(@as(i8, -128), std.mem.readInt(i8, small.bytes[0..1], .little));
+    var buf: [48]u8 = undefined;
+    try std.testing.expectEqualStrings("-128", fmtValue(.int8, small.bytes[0..1], &buf));
+
+    const wide = try encode(.int16, "32767");
+    try std.testing.expectEqualStrings("32767", fmtValue(.int16, wide.bytes[0..2], &buf));
+
+    const lo = try encode(.int16, "-2");
+    const hi = try encode(.int16, "3");
+    try std.testing.expectEqual(std.math.Order.lt, cmpVal(.int16, lo.bytes[0..2], hi.bytes[0..2]).?);
+
+    var c: Cond = .{ .mode = .exact, .a = small };
+    try std.testing.expect(check(.int8, small.bytes[0..1], small.bytes[0..1], &c));
+    try std.testing.expectEqual(@as(usize, 1), Kind.int8.size());
+    try std.testing.expectEqual(Kind.int16, Kind.parse("int16").?);
+}
+
+test "regionSpan clamps to the range and keeps alignment" {
+    const span = regionSpan(.{ .start = 0x1003, .end = 0x1800 }, 0x1000, 0x1000, 4).?;
+    try std.testing.expectEqual(@as(usize, 4), span.off);
+    try std.testing.expectEqual(@as(usize, 0x7FF), span.len);
+
+    const single = regionSpan(.{ .start = 0x1010, .end = 0x1011 }, 0x1000, 0x1000, 4).?;
+    try std.testing.expectEqual(@as(usize, 0x10), single.off);
+    try std.testing.expectEqual(@as(usize, 4), single.len);
+
+    try std.testing.expectEqual(@as(?Span, null), regionSpan(.{ .start = 0x3000, .end = 0x4000 }, 0x1000, 0x1000, 4));
+    try std.testing.expectEqual(@as(?Span, null), regionSpan(.{ .start = 0x1000, .end = 0x1000 }, 0x1000, 0x1000, 4));
 }
 
 test "float exact respects tolerance" {
