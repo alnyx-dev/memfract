@@ -5,6 +5,13 @@ and versions follow the `DEPTH.ITERATION` scheme described in `AGENTS.md`.
 
 ## [Unreleased]
 
+## [1.2] — 2026-11-11
+
+### Fixed
+
+- Release binaries are built for baseline x86_64, so they no longer crash with an
+  illegal instruction on CPUs without AVX-512.
+
 ## [1.1] — 2026-11-11
 
 ### Added
