@@ -19,6 +19,17 @@ A Windows x64 memory scanner written in Zig: a JSON CLI for automation and a Flu
 - Two CLI modes: one-shot commands with a file-backed session, and `serve` with line-by-line JSON over stdin/stdout.
 - GUI with a built-in scanner, a table with value freezing, and light/dark themes.
 
+## Download
+
+Prebuilt Windows x64 binaries are attached to the
+[latest release](https://github.com/alnyx-dev/memfract/releases/latest):
+
+- `memfract.exe` — JSON CLI.
+- `memfract-gui.exe` — GUI.
+
+Put both files in the same directory and run them as administrator. To build
+from source instead, see below.
+
 ## Requirements
 
 - Windows x64.
