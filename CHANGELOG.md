@@ -5,6 +5,24 @@ and versions follow the `DEPTH.ITERATION` scheme described in `AGENTS.md`.
 
 ## [Unreleased]
 
+## [1.4] — 2026-11-11
+
+### Added
+
+- `string` scans (UTF-8 or UTF-16LE via `--encoding`) and `bytes` scans with
+  wildcards such as `48 8B ?? ?? 89`, for `scan first`, `scan next`, and `scan list`.
+  Both support the `exact`, `changed`, and `unchanged` conditions.
+- A redesigned GUI: new dark and light palettes, Segoe UI Variable Display and
+  Cascadia Mono, larger corner radii, and dropdowns with a description for every
+  entry and a check mark on the current one.
+
+### Changed
+
+- The session format is `ZCS4`: it stores variable-length values and the string
+  encoding. `ZCS3` and `ZCS2` files still load.
+- `read`, `write`, `freeze`, `watch`, and the address table reject `string` and
+  `bytes`, which are scan-only types.
+
 ## [1.3] — 2026-11-11
 
 ### Added
