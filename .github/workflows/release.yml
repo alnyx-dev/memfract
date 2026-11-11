@@ -27,21 +27,30 @@ jobs:
           GH_TOKEN: ${{ github.token }}
           REPO: ${{ github.repository }}
         run: |
-          $ErrorActionPreference = 'Stop'
+          $ErrorActionPreference = 'Continue'
           $match = Select-String -Path src/version.zig -Pattern 'pub const string = "([^"]+)"'
           if (-not $match) { throw 'cannot read the version from src/version.zig' }
           $version = $match.Matches[0].Groups[1].Value
           $tag = "v$version"
 
           git fetch --tags --force
+          if ($LASTEXITCODE -ne 0) { throw 'git fetch failed' }
+
           $tagExists = [bool](git ls-remote --tags origin "refs/tags/$tag")
-          gh release view $tag --repo $env:REPO *> $null
-          if ($tagExists -and $LASTEXITCODE -eq 0) {
+          if ($LASTEXITCODE -ne 0) { throw 'git ls-remote failed' }
+
+          $releases = gh release list --repo $env:REPO --limit 100 --json tagName | ConvertFrom-Json
+          if ($LASTEXITCODE -ne 0) { throw 'gh release list failed' }
+          $releaseExists = [bool]($releases | Where-Object { $_.tagName -eq $tag })
+
+          if ($tagExists -and $releaseExists) {
             Write-Host "Release $tag already exists; nothing to do."
             exit 0
           }
-
-          if ($tagExists) { git checkout $tag }
+          if ($tagExists) {
+            git checkout $tag
+            if ($LASTEXITCODE -ne 0) { throw "cannot check out $tag" }
+          }
 
           "TAG=$tag" | Out-File -FilePath $env:GITHUB_ENV -Append -Encoding utf8
           "TAG_EXISTS=$($tagExists.ToString().ToLower())" | Out-File -FilePath $env:GITHUB_ENV -Append -Encoding utf8
@@ -58,9 +67,11 @@ jobs:
         if: env.TAG != '' && env.TAG_EXISTS == 'false'
         shell: pwsh
         run: |
-          $ErrorActionPreference = 'Stop'
+          $ErrorActionPreference = 'Continue'
           git tag $env:TAG
+          if ($LASTEXITCODE -ne 0) { throw 'git tag failed' }
           git push origin "refs/tags/$env:TAG"
+          if ($LASTEXITCODE -ne 0) { throw 'git push failed' }
 
       - name: Publish
         if: env.TAG != ''
@@ -69,12 +80,16 @@ jobs:
           GH_TOKEN: ${{ github.token }}
           REPO: ${{ github.repository }}
         run: |
-          $ErrorActionPreference = 'Stop'
+          $ErrorActionPreference = 'Continue'
           $notesFile = Join-Path $env:RUNNER_TEMP 'notes.md'
 
           git fetch --tags --force
-          $prev = git describe --tags --abbrev=0 "$env:TAG^" 2>$null
-          $range = if ($LASTEXITCODE -eq 0 -and $prev) { "$prev..$env:TAG" } else { $env:TAG }
+          if ($LASTEXITCODE -ne 0) { throw 'git fetch failed' }
+
+          $prev = git tag --merged $env:TAG --sort=-v:refname |
+            Where-Object { $_ -ne $env:TAG } |
+            Select-Object -First 1
+          $range = if ($prev) { "$prev..$env:TAG" } else { $env:TAG }
 
           $breaking = @()
           $changes = @()
@@ -94,3 +109,4 @@ jobs:
           if ($env:TAG -match '-') { $flags += '--prerelease' }
 
           gh release create $env:TAG --repo $env:REPO --title $env:TAG --notes-file $notesFile --verify-tag @flags zig-out/bin/memfract.exe zig-out/bin/memfract-gui.exe
+          if ($LASTEXITCODE -ne 0) { throw 'gh release create failed' }
