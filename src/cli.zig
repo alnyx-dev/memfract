@@ -148,6 +148,9 @@ const Session = struct {
     table: std.ArrayList(Row) = .empty,
     dirty: bool = false,
     notice: []const u8 = "",
+    /// Serve keeps one-shot state in memory; undo history then never touches disk.
+    file_backed: bool = true,
+    undo: ?scan.Scanner = null,
 };
 
 fn W(comptime s: []const u8) []const u16 {
@@ -291,6 +294,7 @@ fn decodeSession(data: []const u8, s: *Session) !void {
 
 fn freeSession(s: *Session) void {
     s.sc.deinit(gpa);
+    if (s.undo) |*u| u.deinit(gpa);
     for (s.table.items) |row| gpa.free(row.desc);
     s.table.deinit(gpa);
 }
@@ -329,7 +333,159 @@ fn encodeSession(a: std.mem.Allocator, s: *Session) ![]u8 {
     return out.toOwnedSlice(a);
 }
 
+const snapshot_magic = "ZSN1";
+
+const SnapshotMeta = struct {
+    pid: u32 = 0,
+    ctime: u64 = 0,
+    scanned: bool = false,
+};
+
+fn encodeSnapshot(a: std.mem.Allocator, sc: *const scan.Scanner, meta: SnapshotMeta) ![]u8 {
+    var out: std.ArrayList(u8) = .empty;
+    errdefer out.deinit(a);
+
+    const value_len = sc.valueLen();
+    if (value_len != 0 and sc.values.items.len != sc.matches.items.len * value_len)
+        return error.CorruptSnapshot;
+
+    try out.appendSlice(a, snapshot_magic);
+    try putInt(a, &out, u32, meta.pid);
+    try putInt(a, &out, u64, meta.ctime);
+    try out.append(a, @backingInt(sc.kind));
+    try out.append(a, @backingInt(sc.encoding));
+    try out.append(a, @intFromBool(meta.scanned));
+    try out.append(a, @intFromBool(sc.truncated));
+    try putInt(a, &out, u64, value_len);
+    try putInt(a, &out, u64, sc.matches.items.len);
+    for (sc.matches.items, 0..) |m, i| {
+        try putInt(a, &out, u64, m.addr);
+        try out.appendSlice(a, sc.valueAt(i));
+    }
+    return out.toOwnedSlice(a);
+}
+
+fn decodeSnapshot(data: []const u8, sc: *scan.Scanner, meta: *SnapshotMeta) !void {
+    decodeSnapshotData(data, sc, meta) catch |e| {
+        if (e == error.CorruptSession) return error.CorruptSnapshot;
+        return e;
+    };
+}
+
+fn decodeSnapshotData(data: []const u8, sc: *scan.Scanner, meta: *SnapshotMeta) !void {
+    var c: Cur = .{ .d = data };
+    if (!std.mem.eql(u8, try c.take(4), snapshot_magic)) return error.CorruptSnapshot;
+    meta.pid = try c.u32_();
+    meta.ctime = try c.u64_();
+    const kind_i = try c.u8_();
+    const enc_i = try c.u8_();
+    meta.scanned = (try c.u8_()) != 0;
+    sc.truncated = (try c.u8_()) != 0;
+    sc.kind = std.enums.fromInt(scan.Kind, kind_i) orelse return error.CorruptSnapshot;
+
+    const vlen = try c.u64_();
+    if (sc.kind.isVariable()) {
+        if (vlen == 0 or vlen > scan.max_value_len) return error.CorruptSnapshot;
+        sc.value_len = @intCast(vlen);
+        sc.encoding = std.enums.fromInt(scan.Encoding, enc_i) orelse return error.CorruptSnapshot;
+    } else {
+        if (vlen != sc.kind.size()) return error.CorruptSnapshot;
+        sc.value_len = sc.kind.size();
+        sc.encoding = .utf8;
+    }
+
+    const count = try c.u64_();
+    const record = 8 + sc.value_len;
+    if (count > (data.len - c.p) / record) return error.CorruptSnapshot;
+    try sc.matches.ensureTotalCapacity(gpa, @intCast(count));
+    try sc.values.ensureTotalCapacity(gpa, @as(usize, @intCast(count)) * sc.value_len);
+
+    var prev: u64 = 0;
+    var i: u64 = 0;
+    while (i < count) : (i += 1) {
+        const addr = try c.u64_();
+        if (i > 0 and addr <= prev) return error.CorruptSnapshot;
+        prev = addr;
+        sc.matches.appendAssumeCapacity(.{ .addr = @intCast(addr) });
+        try sc.values.appendSlice(gpa, try c.take(sc.value_len));
+    }
+}
+
 const corrupt_notice = "the saved session file was corrupt; it was moved to <name>.session.corrupt and a fresh session was started";
+
+fn undoPath(a: std.mem.Allocator, name: []const u8) ![:0]u16 {
+    return sessionPathSuffix(a, name, ".undo");
+}
+
+fn dropUndoFile(a: std.mem.Allocator, name: []const u8) void {
+    const path = undoPath(a, name) catch return;
+    win.deleteFile(path.ptr);
+}
+
+fn clearUndo(a: std.mem.Allocator, s: *Session) void {
+    if (s.undo) |*u| u.deinit(gpa);
+    s.undo = null;
+    if (!s.file_backed) return;
+    dropUndoFile(a, s.name);
+}
+
+fn hasUndo(a: std.mem.Allocator, s: *Session) bool {
+    if (!s.file_backed) return s.undo != null;
+    const path = undoPath(a, s.name) catch return false;
+    return win.fileExists(path.ptr);
+}
+
+const undo_notice = "the previous result set could not be saved; 'scan undo' is unavailable";
+
+/// Remember the current results before a scan replaces or clears them. Best effort:
+/// a full disk only costs the undo step, not the scan itself.
+fn stashUndo(a: std.mem.Allocator, s: *Session) void {
+    if (!s.scanned) return;
+    if (!s.file_backed) {
+        var copy: scan.Scanner = .{};
+        copy.copyFrom(gpa, &s.sc) catch {
+            s.notice = undo_notice;
+            return;
+        };
+        if (s.undo) |*u| u.deinit(gpa);
+        s.undo = copy;
+        return;
+    }
+    const data = encodeSnapshot(a, &s.sc, .{ .pid = s.pid, .ctime = s.ctime, .scanned = s.scanned }) catch {
+        s.notice = undo_notice;
+        return;
+    };
+    const path = undoPath(a, s.name) catch {
+        s.notice = undo_notice;
+        return;
+    };
+    win.writeFileAtomic(path.ptr, data) catch {
+        s.notice = undo_notice;
+        return;
+    };
+}
+
+fn takeUndo(a: std.mem.Allocator, s: *Session, meta: *SnapshotMeta) !scan.Scanner {
+    if (!s.file_backed) {
+        const u = s.undo orelse return error.NoUndo;
+        s.undo = null;
+        return u;
+    }
+    const path = try undoPath(a, s.name);
+    const data = win.readFileMax(a, path.ptr, 1 << 30) catch |e| {
+        if (e == error.OutOfMemory) return e;
+        if (e == error.FileOpenFailed) return error.NoUndo;
+        return error.UndoFailed;
+    };
+    var sc: scan.Scanner = .{};
+    errdefer sc.deinit(gpa);
+    decodeSnapshot(data, &sc, meta) catch {
+        win.deleteFile(path.ptr);
+        return error.CorruptUndo;
+    };
+    win.deleteFile(path.ptr);
+    return sc;
+}
 
 fn quarantineSession(a: std.mem.Allocator, name: []const u8) void {
     const src = sessionPath(a, name) catch return;
@@ -346,6 +502,7 @@ fn loadSession(a: std.mem.Allocator, s: *Session) void {
             s.notice = corrupt_notice;
             s.dirty = true;
             quarantineSession(a, s.name);
+            dropUndoFile(a, s.name);
         }
         return;
     };
@@ -357,6 +514,7 @@ fn loadSession(a: std.mem.Allocator, s: *Session) void {
             s.notice = corrupt_notice;
             s.dirty = true;
             quarantineSession(a, s.name);
+            dropUndoFile(a, s.name);
         }
         return;
     };
@@ -388,7 +546,7 @@ fn findPid(a: std.mem.Allocator, name: []const u8) !u32 {
     return fail(error.Ambiguous, "{d} processes match '{s}'; use --pid or the exact name", .{ list.items.len, name });
 }
 
-fn attachPid(s: *Session, pid: u32) !void {
+fn attachPid(a: std.mem.Allocator, s: *Session, pid: u32) !void {
     const p = win.Process.open(pid) catch
         return fail(error.OpenFailed, "cannot open PID {d} (run as Administrator, or the PID does not exist)", .{pid});
     const ct = p.creationTime();
@@ -402,6 +560,7 @@ fn attachPid(s: *Session, pid: u32) !void {
         s.sc.deinit(gpa);
         s.sc = .{};
         s.scanned = false;
+        clearUndo(a, s);
     }
     s.proc = p;
     s.pid = pid;
@@ -419,12 +578,12 @@ fn getProc(a: std.mem.Allocator, s: *Session, args: Args) !win.Process {
         want = try findPid(a, n);
     }
     if (want) |pid| {
-        if (s.proc == null or s.pid != pid) try attachPid(s, pid);
+        if (s.proc == null or s.pid != pid) try attachPid(a, s, pid);
         return s.proc.?;
     }
     if (s.proc) |p| return p;
     if (s.pid != 0) {
-        try attachPid(s, s.pid);
+        try attachPid(a, s, s.pid);
         return s.proc.?;
     }
     return fail(error.NoProcess, "no process selected: pass --pid/--process or run 'attach' first", .{});
@@ -527,7 +686,7 @@ fn scanRange(a: std.mem.Allocator, s: *Session, args: Args) !scan.Range {
 fn modeArg(args: Args, default: scan.Mode) !scan.Mode {
     const t = args.opt("--cond") orelse return default;
     return std.meta.stringToEnum(scan.Mode, t) orelse
-        return fail(error.BadArgs, "unknown --cond '{s}' (exact, greater, less, between, unknown, changed, unchanged, increased, decreased)", .{t});
+        return fail(error.BadArgs, "unknown --cond '{s}' (exact, greater, less, between, unknown, changed, unchanged, increased, decreased, delta)", .{t});
 }
 
 fn encodeArg(kind: scan.Kind, text: []const u8, what: []const u8) !scan.Value {
@@ -556,7 +715,7 @@ fn buildCond(kind: scan.Kind, mode: scan.Mode, default_encoding: scan.Encoding, 
     }
 
     const needs = switch (mode) {
-        .exact, .greater, .less, .between => true,
+        .exact, .greater, .less, .between, .delta => true,
         else => false,
     };
     if (!needs) return cond;
@@ -719,10 +878,12 @@ const help_entries = [_]HelpEntry{
     .{ .name = "read", .usage = "read --addr A [--offsets o1,o2] (--type T | --size N)", .desc = "Read a typed value or a hex dump. A is 0x... or module+offset. --offsets follows a pointer chain." },
     .{ .name = "write", .usage = "write --addr A --value V [--type T] [--offsets o1,o2]", .desc = "Write a value and read it back." },
     .{ .name = "scan first", .usage = "scan first [--type T] [--cond C] [--value V] [--value2 V] [--encoding E] [--module NAME] [--start A] [--end A] [--align N] [--threads N] [--all] [--tol X] [--timeout MS]", .desc = "First scan. Conds: exact, greater, less, between, unknown. Scans writable memory unless --all; --module/--start/--end limit the address range. --align N (a power of two, default the type size) sets the address alignment; use --align 1 for unaligned values. --threads N sets the worker count (default: CPU count). string and bytes scans need --cond exact with --value as the pattern." },
-    .{ .name = "scan next", .usage = "scan next --cond C [--value V] [--value2 V] [--encoding E] [--tol X] [--timeout MS]", .desc = "Filter previous results. Conds: exact, greater, less, between, changed, unchanged, increased, decreased. For string and bytes only exact, changed and unchanged are supported." },
+    .{ .name = "scan next", .usage = "scan next --cond C [--value V] [--value2 V] [--encoding E] [--tol X] [--timeout MS]", .desc = "Filter previous results. Conds: exact, greater, less, between, changed, unchanged, increased, decreased, delta. --cond delta keeps values that changed by exactly --value (float tolerance via --tol). For string and bytes only exact, changed and unchanged are supported." },
     .{ .name = "scan list", .usage = "scan list [--offset N] [--limit N]", .desc = "Show results with current and previous values (limit <= 10000, default 50). String values are JSON strings; bytes values are hex strings." },
-    .{ .name = "scan status", .usage = "scan status", .desc = "Scan state: count, type, truncated flag." },
-    .{ .name = "scan reset", .usage = "scan reset", .desc = "Discard scan results." },
+    .{ .name = "scan status", .usage = "scan status", .desc = "Scan state: count, type, truncated flag, can_undo." },
+    .{ .name = "scan reset", .usage = "scan reset", .desc = "Discard scan results; the previous result set stays available to 'scan undo'." },
+    .{ .name = "scan undo", .usage = "scan undo", .desc = "Restore the result set that was active before the last scan first, scan next, scan reset or scan snapshot load." },
+    .{ .name = "scan snapshot", .usage = "scan snapshot save|load --file PATH", .desc = "Save the result set to a ZSN1 snapshot file, or replace the current results (and target identity) with one. Loading keeps the current results available to 'scan undo'." },
     .{ .name = "freeze", .usage = "freeze --addr A --value V [--type T] [--offsets ...] [--for MS] [--interval MS] [--timeout MS]", .desc = "Keep writing a value for the given time (blocking). Ctrl+C stops early; --timeout MS caps the duration." },
     .{ .name = "watch", .usage = "watch --addr A [--type T] [--offsets ...] [--interval MS] [--count N] [--timeout MS] [--changes-only]", .desc = "Sample a value repeatedly. Ctrl+C stops early; --timeout MS caps the total time." },
     .{ .name = "table add", .usage = "table add (--addr A [--type T] [--offsets ...] | --from-scan INDEX) [--desc TEXT]", .desc = "Save an address in the session table." },
@@ -743,6 +904,7 @@ const help_notes = [_][]const u8{
     "Integer values accept decimal, hex (0x..), octal (0o..), and binary (0b..) literals; --addr accepts 0x.., decimal, or module+offset.",
     "String scans match the bytes of --value, encoded as --encoding utf8 (default) or utf16le. Bytes scans take a hex pattern such as \"48 8B ?? ?? 89\", where ?? matches any byte. Patterns are limited to 256 bytes and scanned on every byte offset.",
     "One-shot mode keeps scan state in %TEMP%\\memfract\\<session>.session (--session NAME, default 'default'; --no-session disables). Use 'serve' for many commands without disk I/O.",
+    "Before replacing or clearing results, scan first, scan next and scan reset save the previous set to <name>.session.undo; 'scan undo' restores it once. 'scan status' reports can_undo. Snapshots use the same ZSN1 encoding in any file you choose.",
     "Typical flow: ps -> attach -> scan first -> (change value in target) -> scan next -> scan list -> table add -> write/freeze.",
     "First scans read memory on all CPU cores and use vectorized exact matching for integer types; --threads N overrides the worker count. Scan responses include regions_scanned (regions for scan first, read windows for scan next), bytes_read (bytes actually read) and elapsed_ms. A failed block read falls back to 4 KB pages.",
     "Run as Administrator to open most processes. Not for use against online games or protected processes.",
@@ -829,7 +991,7 @@ fn cmdAttach(a: std.mem.Allocator, s: *Session, args: Args, w: *json.Writer) !vo
     try w.kvBool("attached", true);
 }
 
-fn cmdDetach(s: *Session, w: *json.Writer) !void {
+fn cmdDetach(a: std.mem.Allocator, s: *Session, w: *json.Writer) !void {
     if (s.proc) |p| p.close();
     s.proc = null;
     s.pid = 0;
@@ -837,6 +999,7 @@ fn cmdDetach(s: *Session, w: *json.Writer) !void {
     s.sc.deinit(gpa);
     s.sc = .{};
     s.scanned = false;
+    clearUndo(a, s);
     s.dirty = true;
     try w.kvBool("detached", true);
 }
@@ -901,7 +1064,7 @@ fn scanSummary(s: *Session, w: *json.Writer, elapsed_ms: u64) !void {
 }
 
 fn cmdScan(a: std.mem.Allocator, s: *Session, args: Args, w: *json.Writer) !void {
-    const sub = args.pos(1) orelse return fail(error.BadArgs, "scan needs a subcommand: first | next | list | status | reset", .{});
+    const sub = args.pos(1) orelse return fail(error.BadArgs, "scan needs a subcommand: first | next | list | status | reset | undo | snapshot", .{});
 
     if (std.mem.eql(u8, sub, "first")) {
         const p = try getProc(a, s, args);
@@ -917,6 +1080,7 @@ fn cmdScan(a: std.mem.Allocator, s: *Session, args: Args, w: *json.Writer) !void
         const timeout = try timeoutArg(args);
         const threads = try threadsArg(args);
 
+        stashUndo(a, s);
         startWatchdog(timeout);
         const t0 = GetTickCount64();
         const res = s.sc.first(gpa, p, kind, cond, !args.flag("--all"), range, alignment, threads);
@@ -941,6 +1105,7 @@ fn cmdScan(a: std.mem.Allocator, s: *Session, args: Args, w: *json.Writer) !void
         const cond = try buildCond(s.sc.kind, mode, s.sc.encoding, args);
         const timeout = try timeoutArg(args);
 
+        stashUndo(a, s);
         startWatchdog(timeout);
         const t0 = GetTickCount64();
         const canceled = s.sc.next(p, cond);
@@ -991,15 +1156,94 @@ fn cmdScan(a: std.mem.Allocator, s: *Session, args: Args, w: *json.Writer) !void
         try w.kvStr("type", @tagName(s.sc.kind));
         try w.kvInt("count", s.sc.matches.items.len);
         try w.kvBool("truncated", s.sc.truncated);
+        try w.kvBool("can_undo", hasUndo(a, s));
     } else if (std.mem.eql(u8, sub, "reset")) {
+        stashUndo(a, s);
         s.sc.deinit(gpa);
         s.sc = .{};
         s.scanned = false;
         s.dirty = true;
         try w.kvBool("reset", true);
+    } else if (std.mem.eql(u8, sub, "undo")) {
+        var meta: SnapshotMeta = .{};
+        const prev = takeUndo(a, s, &meta) catch |e| switch (e) {
+            error.NoUndo => return fail(error.NoUndo, "nothing to undo: no previous result set was saved", .{}),
+            error.CorruptUndo => return fail(error.CorruptUndo, "the saved undo history was corrupt and has been deleted", .{}),
+            error.UndoFailed => return fail(error.UndoFailed, "cannot read the saved undo history", .{}),
+            else => return e,
+        };
+        s.sc.deinit(gpa);
+        s.sc = prev;
+        s.scanned = true;
+        if (s.pid == 0 and meta.pid != 0) {
+            s.pid = meta.pid;
+            s.ctime = meta.ctime;
+        }
+        s.dirty = true;
+        try w.kvBool("undone", true);
+        try w.kvStr("type", @tagName(s.sc.kind));
+        try w.kvInt("count", s.sc.matches.items.len);
+    } else if (std.mem.eql(u8, sub, "snapshot")) {
+        try cmdSnapshot(a, s, args, w);
     } else {
         return fail(error.BadArgs, "unknown scan subcommand '{s}'", .{sub});
     }
+}
+
+fn cmdSnapshot(a: std.mem.Allocator, s: *Session, args: Args, w: *json.Writer) !void {
+    const action = args.pos(2) orelse return fail(error.BadArgs, "scan snapshot needs 'save' or 'load'", .{});
+    const path = args.opt("--file") orelse return fail(error.BadArgs, "missing --file", .{});
+
+    if (std.mem.eql(u8, action, "save")) {
+        if (!s.scanned) return fail(error.NoScan, "no scan results: run 'scan first' first", .{});
+        const data = try encodeSnapshot(a, &s.sc, .{ .pid = s.pid, .ctime = s.ctime, .scanned = true });
+        const wp = try std.unicode.utf8ToUtf16LeAllocZ(a, path);
+        win.writeFileAtomic(wp.ptr, data) catch return fail(error.FileFailed, "cannot write file '{s}'", .{path});
+        try w.kvStr("file", path);
+        try w.kvStr("type", @tagName(s.sc.kind));
+        try w.kvInt("count", s.sc.matches.items.len);
+        return;
+    }
+
+    if (!std.mem.eql(u8, action, "load"))
+        return fail(error.BadArgs, "unknown scan snapshot action '{s}'", .{action});
+
+    const wp = try std.unicode.utf8ToUtf16LeAllocZ(a, path);
+    const data = win.readFileMax(a, wp.ptr, 1 << 30) catch |e| {
+        if (e == error.OutOfMemory) return e;
+        return fail(error.FileFailed, "cannot read file '{s}'", .{path});
+    };
+    var snap: scan.Scanner = .{};
+    var meta: SnapshotMeta = .{};
+    decodeSnapshot(data, &snap, &meta) catch |e| {
+        snap.deinit(gpa);
+        if (e == error.OutOfMemory) return e;
+        return fail(error.CorruptSnapshot, "'{s}' is not a valid snapshot", .{path});
+    };
+
+    if (meta.pid != 0 and s.pid != 0) {
+        if (meta.pid != s.pid) {
+            snap.deinit(gpa);
+            return fail(error.ProcessMismatch, "the snapshot belongs to PID {d}; the session is attached to PID {d}", .{ meta.pid, s.pid });
+        }
+        if (meta.ctime != 0 and s.ctime != 0 and meta.ctime != s.ctime) {
+            snap.deinit(gpa);
+            return fail(error.StaleSnapshot, "PID {d} was restarted since the snapshot was taken", .{meta.pid});
+        }
+    }
+
+    stashUndo(a, s);
+    s.sc.deinit(gpa);
+    s.sc = snap;
+    s.scanned = meta.scanned;
+    if (meta.pid != 0) {
+        s.pid = meta.pid;
+        s.ctime = meta.ctime;
+    }
+    s.dirty = true;
+    try w.kvStr("file", path);
+    try w.kvStr("type", @tagName(s.sc.kind));
+    try w.kvInt("count", s.sc.matches.items.len);
 }
 
 fn cmdFreeze(a: std.mem.Allocator, s: *Session, args: Args, w: *json.Writer) !void {
@@ -1210,7 +1454,7 @@ fn dispatch(a: std.mem.Allocator, s: *Session, argv: []const []const u8, w: *jso
     if (eq(u8, cmd, "modules")) return cmdModules(a, s, args, w);
     if (eq(u8, cmd, "regions")) return cmdRegions(a, s, args, w);
     if (eq(u8, cmd, "attach")) return cmdAttach(a, s, args, w);
-    if (eq(u8, cmd, "detach")) return cmdDetach(s, w);
+    if (eq(u8, cmd, "detach")) return cmdDetach(a, s, w);
     if (eq(u8, cmd, "read")) return cmdRead(a, s, args, w);
     if (eq(u8, cmd, "write")) return cmdWrite(a, s, args, w);
     if (eq(u8, cmd, "scan")) return cmdScan(a, s, args, w);
@@ -1288,7 +1532,7 @@ fn tokenize(a: std.mem.Allocator, line: []const u8) ![]const []const u8 {
 var line_buf: [16384]u8 = undefined;
 
 fn serve() void {
-    var s: Session = .{ .name = "serve" };
+    var s: Session = .{ .name = "serve", .file_backed = false };
     {
         var arena = std.heap.ArenaAllocator.init(gpa);
         defer arena.deinit();
@@ -1371,7 +1615,7 @@ pub fn main() !void {
 
     const stateless = isStatelessCommand(argv[0]) or args.flag("--no-session");
 
-    var s: Session = .{ .name = name };
+    var s: Session = .{ .name = name, .file_backed = !stateless };
     if (!stateless) loadSession(a, &s);
 
     const code = run(a, &s, argv, &w);
@@ -1595,6 +1839,49 @@ test "session roundtrip keeps string scans" {
     try std.testing.expectEqual(scan.Kind.string, t.sc.kind);
     try std.testing.expectEqual(scan.Encoding.utf16le, t.sc.encoding);
     try std.testing.expectEqualStrings("h\x00i\x00!\x00", t.sc.valueAt(0));
+}
+
+test "snapshot roundtrip keeps scan state and identity" {
+    const a = std.testing.allocator;
+    var s: Session = .{ .name = "snap" };
+    defer freeSession(&s);
+    s.sc.kind = .int16;
+    s.sc.value_len = 2;
+    s.sc.truncated = true;
+    try s.sc.matches.append(gpa, .{ .addr = 0x1234 });
+    try s.sc.values.appendSlice(gpa, &[_]u8{ 0x39, 0x30 });
+
+    const data = try encodeSnapshot(a, &s.sc, .{ .pid = 42, .ctime = 0x99, .scanned = true });
+    defer a.free(data);
+    try std.testing.expectEqualStrings("ZSN1", data[0..4]);
+
+    var t: Session = .{ .name = "snap2" };
+    defer freeSession(&t);
+    var meta: SnapshotMeta = .{};
+    try decodeSnapshot(data, &t.sc, &meta);
+    try std.testing.expectEqual(@as(u32, 42), meta.pid);
+    try std.testing.expectEqual(@as(u64, 0x99), meta.ctime);
+    try std.testing.expect(meta.scanned);
+    try std.testing.expectEqual(scan.Kind.int16, t.sc.kind);
+    try std.testing.expectEqual(@as(usize, 2), t.sc.valueLen());
+    try std.testing.expect(t.sc.truncated);
+    try std.testing.expectEqual(@as(usize, 0x1234), t.sc.matches.items[0].addr);
+    try std.testing.expectEqual(@as(i16, 12345), std.mem.readInt(i16, t.sc.valueAt(0)[0..2], .little));
+
+    try std.testing.expectError(error.CorruptSnapshot, decodeSnapshot(data[0 .. data.len - 1], &t.sc, &meta));
+}
+
+test "delta condition parses --value" {
+    const argv = [_][]const u8{ "scan", "next", "--cond", "delta", "--value", "5" };
+    const c = try buildCond(.int32, .delta, .utf8, .{ .v = &argv });
+    try std.testing.expectEqual(scan.Mode.delta, c.mode);
+    try std.testing.expectEqual(@as(i32, 5), std.mem.readInt(i32, c.a.bytes[0..4], .little));
+
+    const missing = [_][]const u8{ "scan", "next", "--cond", "delta" };
+    try std.testing.expectError(error.BadArgs, buildCond(.int32, .delta, .utf8, .{ .v = &missing }));
+
+    const string_argv = [_][]const u8{ "scan", "next", "--cond", "delta", "--value", "1" };
+    try std.testing.expectError(error.BadArgs, buildCond(.string, .delta, .utf8, .{ .v = &string_argv }));
 }
 
 test "buildCond parses binary patterns" {

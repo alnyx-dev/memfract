@@ -139,6 +139,20 @@ fn asF64(kind: Kind, b: []const u8) f64 {
     }
 }
 
+fn asI128(kind: Kind, b: []const u8) i128 {
+    return switch (kind) {
+        .int8 => std.mem.readInt(i8, b[0..1], .little),
+        .int16 => std.mem.readInt(i16, b[0..2], .little),
+        .int32 => std.mem.readInt(i32, b[0..4], .little),
+        .int64 => std.mem.readInt(i64, b[0..8], .little),
+        .uint8 => std.mem.readInt(u8, b[0..1], .little),
+        .uint16 => std.mem.readInt(u16, b[0..2], .little),
+        .uint32 => std.mem.readInt(u32, b[0..4], .little),
+        .uint64 => std.mem.readInt(u64, b[0..8], .little),
+        else => 0,
+    };
+}
+
 pub fn cmpVal(kind: Kind, x: []const u8, y: []const u8) ?std.math.Order {
     switch (kind) {
         .int8 => return std.math.order(std.mem.readInt(i8, x[0..1], .little), std.mem.readInt(i8, y[0..1], .little)),
@@ -169,6 +183,7 @@ pub const Mode = enum {
     unchanged,
     increased,
     decreased,
+    delta,
 };
 
 pub const Cond = struct {
@@ -235,6 +250,16 @@ fn check(kind: Kind, cur: []const u8, old: []const u8, c: *const Cond) bool {
         .decreased => {
             const o = cmpVal(kind, cur, old) orelse return false;
             return o == .lt;
+        },
+        .delta => {
+            if (kind.isFloat()) {
+                const x = asF64(kind, cur);
+                const y = asF64(kind, old);
+                const n = asF64(kind, c.a.bytes[0..sz]);
+                if (std.math.isNan(x) or std.math.isNan(y)) return false;
+                return @abs((x - y) - n) <= c.tol;
+            }
+            return asI128(kind, cur) - asI128(kind, old) == asI128(kind, c.a.bytes[0..sz]);
         },
         .exact => {
             if (kind.isFloat() and c.tol > 0) {
@@ -428,6 +453,19 @@ pub const Scanner = struct {
         self.truncated = false;
         self.stats = .{};
         self.budget = null;
+    }
+
+    /// Replace the results with a copy of `src`, reusing the current capacity.
+    pub fn copyFrom(self: *Scanner, gpa: std.mem.Allocator, src: *const Scanner) !void {
+        self.reset();
+        errdefer self.reset();
+        self.kind = src.kind;
+        self.encoding = src.encoding;
+        self.value_len = src.value_len;
+        self.truncated = src.truncated;
+        self.stats = src.stats;
+        try self.matches.appendSlice(gpa, src.matches.items);
+        try self.values.appendSlice(gpa, src.values.items);
     }
 
     fn addMatch(self: *Scanner, gpa: std.mem.Allocator, addr: usize, bytes: []const u8) !bool {
@@ -1215,6 +1253,48 @@ test "firstSource scans regions on several threads and merges in address order" 
     for (single.matches.items, 0..) |m, i| {
         try std.testing.expectEqual(threaded.matches.items[i].addr, m.addr);
     }
+}
+
+test "delta keeps values that changed by exactly N" {
+    var c: Cond = .{ .mode = .delta, .a = try encode(.int32, "7") };
+    try std.testing.expect(check(.int32, (try encode(.int32, "17")).bytes[0..4], (try encode(.int32, "10")).bytes[0..4], &c));
+    try std.testing.expect(!check(.int32, (try encode(.int32, "18")).bytes[0..4], (try encode(.int32, "10")).bytes[0..4], &c));
+    try std.testing.expect(!check(.int32, (try encode(.int32, "3")).bytes[0..4], (try encode(.int32, "10")).bytes[0..4], &c));
+
+    c = .{ .mode = .delta, .a = try encode(.int32, "-7") };
+    try std.testing.expect(check(.int32, (try encode(.int32, "3")).bytes[0..4], (try encode(.int32, "10")).bytes[0..4], &c));
+
+    c = .{ .mode = .delta, .a = try encode(.uint16, "1") };
+    try std.testing.expect(check(.uint16, (try encode(.uint16, "65535")).bytes[0..2], (try encode(.uint16, "65534")).bytes[0..2], &c));
+
+    var f: Cond = .{ .mode = .delta, .a = try encode(.float32, "1.5"), .tol = 0.01 };
+    try std.testing.expect(check(.float32, (try encode(.float32, "12.5")).bytes[0..4], (try encode(.float32, "11.0")).bytes[0..4], &f));
+    try std.testing.expect(!check(.float32, (try encode(.float32, "12.6")).bytes[0..4], (try encode(.float32, "11.0")).bytes[0..4], &f));
+}
+
+test "copyFrom copies type and results" {
+    const a = std.testing.allocator;
+    var s: Scanner = .{};
+    defer s.deinit(a);
+    s.kind = .uint16;
+    s.encoding = .utf16le;
+    s.value_len = 2;
+    s.truncated = true;
+    try s.matches.append(a, .{ .addr = 0x3000 });
+    try s.values.appendSlice(a, &[_]u8{ 3, 0 });
+
+    var copy: Scanner = .{};
+    defer copy.deinit(a);
+    try copy.copyFrom(a, &s);
+    try std.testing.expectEqual(Kind.uint16, copy.kind);
+    try std.testing.expectEqual(Encoding.utf16le, copy.encoding);
+    try std.testing.expect(copy.truncated);
+    try std.testing.expectEqual(@as(usize, 1), copy.matches.items.len);
+    try std.testing.expectEqual(@as(usize, 0x3000), copy.matches.items[0].addr);
+    try std.testing.expectEqual(@as(u16, 3), std.mem.readInt(u16, copy.valueAt(0)[0..2], .little));
+
+    try copy.copyFrom(a, &s);
+    try std.testing.expectEqual(@as(usize, 1), copy.matches.items.len);
 }
 
 test "nextSource filters changed values and coalesces reads" {

@@ -307,6 +307,7 @@ extern "kernel32" fn GetFileSize(h: HANDLE, high: ?*u32) callconv(.winapi) u32;
 extern "kernel32" fn FlushFileBuffers(h: HANDLE) callconv(.winapi) i32;
 extern "kernel32" fn MoveFileExW(from: [*:0]const u16, to: [*:0]const u16, flags: u32) callconv(.winapi) i32;
 extern "kernel32" fn DeleteFileW(name: [*:0]const u16) callconv(.winapi) i32;
+extern "kernel32" fn GetFileAttributesW(name: [*:0]const u16) callconv(.winapi) u32;
 
 const MOVEFILE_REPLACE_EXISTING = 0x1;
 const MOVEFILE_WRITE_THROUGH = 0x8;
@@ -359,6 +360,14 @@ pub fn writeFileAtomic(path: [*:0]const u16, data: []const u8) !void {
 pub fn moveFileReplace(from: [*:0]const u16, to: [*:0]const u16) !void {
     if (MoveFileExW(from, to, MOVEFILE_REPLACE_EXISTING | MOVEFILE_WRITE_THROUGH) == 0)
         return error.FileRenameFailed;
+}
+
+pub fn deleteFile(path: [*:0]const u16) void {
+    _ = DeleteFileW(path);
+}
+
+pub fn fileExists(path: [*:0]const u16) bool {
+    return GetFileAttributesW(path) != 0xFFFFFFFF;
 }
 
 pub fn readFileMax(gpa: std.mem.Allocator, path: [*:0]const u16, max: usize) ![]u8 {

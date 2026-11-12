@@ -14,7 +14,8 @@ A Windows x64 memory scanner written in Zig: a JSON CLI for automation and a Flu
 - Integer values accept decimal, hex (`0x..`), octal, and binary literals.
 - Limit a first scan to a module or an address range (`--module`, `--start`, `--end`) and choose the address alignment (`--align`, use `1` for unaligned values).
 - First scans run on all CPU cores (`--threads N` to override) and compare integer `exact` values with SIMD; responses report `regions_scanned`, `bytes_read`, and `elapsed_ms`.
-- Conditions: exact, greater/less, between, changed/unchanged, increased/decreased, unknown initial value. `string` and `bytes` scans support exact, changed, and unchanged.
+- Conditions: exact, greater/less, between, changed/unchanged, increased/decreased, delta (changed by exactly N), unknown initial value. `string` and `bytes` scans support exact, changed, and unchanged.
+- Undo the last scan step (`scan undo`) and save or restore a result set in a snapshot file (`scan snapshot save|load`).
 - Pointer chains (`module+offset`, `--offsets`) and stable addresses.
 - Address table with descriptions, save/load in a GUI-compatible text format.
 - Two CLI modes: one-shot commands with a file-backed session, and `serve` with line-by-line JSON over stdin/stdout.
@@ -78,6 +79,14 @@ Useful build steps:
 .\zig-out\bin\memfract.exe scan next --cond exact --value 93
 .\zig-out\bin\memfract.exe scan list
 
+# or keep only values that changed by a known amount
+.\zig-out\bin\memfract.exe scan first --type int32 --value 100
+.\zig-out\bin\memfract.exe scan next --cond delta --value -7
+
+# keep the result set, or go back one step
+.\zig-out\bin\memfract.exe scan snapshot save --file hp.zsn
+.\zig-out\bin\memfract.exe scan undo
+
 # text and byte-pattern scans
 .\zig-out\bin\memfract.exe scan first --type string --value "player health"
 .\zig-out\bin\memfract.exe scan first --type bytes --value "48 8B ?? ?? 89"
@@ -108,7 +117,8 @@ For a series of commands, use `serve`:
 
 Run `zig-out\bin\memfract-gui.exe` as administrator. The scanner and address table share one window
 with three areas: a results list, a scan panel, and a saved-address table. Pick a process at the top,
-enter a value, and press First Scan, then refine with Next. Double-click a result to add it to the
+enter a value, and press First Scan, then refine with Next. Undo restores the result set from
+before the last scan or reset. Double-click a result to add it to the
 table; double-click a table row to freeze it. `Save` and `Load` in the table header use
 `memfract_table.txt` next to the executable or in the current directory, and `Theme` switches
 light/dark instantly. Closing the window during a scan cancels it and exits cleanly.

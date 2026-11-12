@@ -326,9 +326,10 @@ var b_card_res: Box = bx(16, 60, 440, 320);
 var b_results: Box = bx(32, 118, 408, 246);
 
 var b_card_scan: Box = bx(472, 60, 472, 320);
-var b_first: Box = bx(488, 76, 140, 40);
-var b_next: Box = bx(636, 76, 140, 40);
-var b_reset: Box = bx(784, 76, 144, 40);
+var b_first: Box = bx(488, 76, 104, 40);
+var b_next: Box = bx(600, 76, 104, 40);
+var b_undo: Box = bx(712, 76, 104, 40);
+var b_reset: Box = bx(824, 76, 104, 40);
 var b_value_full: Box = bx(488, 130, 440, 36);
 var b_value_half: Box = bx(488, 130, 214, 36);
 var b_value2: Box = bx(714, 130, 214, 36);
@@ -380,10 +381,12 @@ fn layout() void {
 
     const sx = b_card_scan.x + 16;
     const sw = b_card_scan.w - 32;
-    const btn_w = @divTrunc((sw - 16) * 140, 424);
+    const btn_gap: i32 = 8;
+    const btn_w = @divTrunc((sw - btn_gap * 3) * 106, 424);
     b_first = bx(sx, b_card_scan.y + 16, btn_w, 40);
-    b_next = bx(b_first.x + btn_w + 8, b_card_scan.y + 16, btn_w, 40);
-    b_reset = bx(b_next.x + btn_w + 8, b_card_scan.y + 16, sw - btn_w * 2 - 16, 40);
+    b_next = bx(b_first.x + btn_w + btn_gap, b_card_scan.y + 16, btn_w, 40);
+    b_undo = bx(b_next.x + btn_w + btn_gap, b_card_scan.y + 16, btn_w, 40);
+    b_reset = bx(b_undo.x + btn_w + btn_gap, b_card_scan.y + 16, sw - btn_w * 3 - btn_gap * 3, 40);
 
     const value_y = b_card_scan.y + 70;
     const half = @divTrunc(sw - 12, 2);
@@ -435,6 +438,7 @@ const ID_POPUP: usize = 21;
 const ID_PICK_CLOSE: usize = 22;
 const ID_SAVE: usize = 23;
 const ID_LOAD: usize = 24;
+const ID_UNDO: usize = 25;
 
 const TIMER_FREEZE: usize = 1;
 const TIMER_LIVE: usize = 2;
@@ -444,7 +448,7 @@ const TIMER_FILTER: usize = 4;
 const PopupKind = enum { none, type, cond };
 
 const first_modes = [_]scan.Mode{ .exact, .greater, .less, .between, .unknown };
-const next_modes = [_]scan.Mode{ .exact, .greater, .less, .between, .changed, .unchanged, .increased, .decreased };
+const next_modes = [_]scan.Mode{ .exact, .greater, .less, .between, .changed, .unchanged, .increased, .decreased, .delta };
 const type_kinds = [_]scan.Kind{ .int8, .uint8, .int16, .uint16, .int32, .uint32, .int64, .uint64, .float32, .float64 };
 const type_names = [_][]const u8{ "int8", "uint8", "int16", "uint16", "int32", "uint32", "int64", "uint64", "float32", "float64" };
 
@@ -466,6 +470,7 @@ const Ui = struct {
     value2: HWND,
     btn_first: HWND,
     btn_next: HWND,
+    btn_undo: HWND,
     btn_reset: HWND,
     writable: HWND,
     results: HWND,
@@ -500,6 +505,9 @@ const Job = struct {
     p: win.Process,
     err: ?[]const u8,
     canceled: bool,
+    keep_undo: bool,
+    undo_ready: bool = false,
+    undo: scan.Scanner = .{},
 };
 
 var ui: Ui = undefined;
@@ -518,7 +526,7 @@ var popup_items: [10][]const u8 = undefined;
 var popup_n: usize = 0;
 var popup_cur: usize = std.math.maxInt(usize);
 var popup_rc: Box = .{ .x = 0, .y = 0, .w = 0, .h = 0 };
-var popup_cond_list: [8]scan.Mode = undefined;
+var popup_cond_list: [9]scan.Mode = undefined;
 var popup_closed_kind: PopupKind = .none;
 var popup_closed_at: u64 = 0;
 
@@ -534,6 +542,8 @@ var proc: ?win.Process = null;
 var proc_label: [96]u8 = undefined;
 var proc_label_len: usize = 0;
 var sc: scan.Scanner = .{};
+var undo_sc: scan.Scanner = .{};
+var undo_active: bool = false;
 var procs: std.ArrayList(win.ProcEntry) = .empty;
 var table: std.ArrayList(Row) = .empty;
 
@@ -667,6 +677,7 @@ fn condLabel(m: scan.Mode) []const u8 {
         .unchanged => "Unchanged",
         .increased => "Increased",
         .decreased => "Decreased",
+        .delta => "Delta",
     };
 }
 
@@ -1026,6 +1037,7 @@ fn popupDetail(idx: usize) []const u8 {
             .unchanged => "Same as the previous scan",
             .increased => "Higher than the previous scan",
             .decreased => "Lower than the previous scan",
+            .delta => "Changed by exactly the entered value",
         },
     };
 }
@@ -1149,6 +1161,7 @@ fn relayout() void {
     moveBox(ui.results, b_results);
     moveBox(ui.btn_first, b_first);
     moveBox(ui.btn_next, b_next);
+    moveBox(ui.btn_undo, b_undo);
     moveBox(ui.btn_reset, b_reset);
     layoutValue();
     moveBox(ui.value2, editRect(b_value2, 26));
@@ -1188,6 +1201,7 @@ fn syncControls() void {
     const attached = proc != null;
     setEnabled(ui.btn_first, !running);
     setEnabled(ui.btn_next, !running and attached and scan_active);
+    setEnabled(ui.btn_undo, !running and undo_active);
     setEnabled(ui.btn_reset, !running and attached and scan_active);
     setEnabled(ui.pill, !running);
     setEnabled(ui.cancel, running);
@@ -1205,10 +1219,11 @@ fn setPicker(on: bool) void {
     show(ui.pick_close, on);
 
     const main_ctrls = [_]HWND{
-        ui.results,    ui.dd_type,    ui.dd_cond,   ui.value,
-        ui.btn_first,  ui.btn_next,   ui.btn_reset, ui.writable,
-        ui.table,      ui.desc,       ui.newval,    ui.btn_write,
-        ui.btn_freeze, ui.btn_delete, ui.save,      ui.load,
+        ui.results,   ui.dd_type,    ui.dd_cond,    ui.value,
+        ui.btn_first, ui.btn_next,   ui.btn_undo,   ui.btn_reset,
+        ui.writable,  ui.table,      ui.desc,       ui.newval,
+        ui.btn_write, ui.btn_freeze, ui.btn_delete, ui.save,
+        ui.load,
     };
     for (main_ctrls) |h| show(h, !on);
     show(ui.value2, !on and cond_mode == .between);
@@ -1443,6 +1458,9 @@ fn attach() void {
     syncFreezeTimer();
     sc.deinit(gpa);
     sc = .{};
+    undo_sc.deinit(gpa);
+    undo_sc = .{};
+    undo_active = false;
     clearResultsCache();
 
     const lbl = std.fmt.bufPrint(&proc_label, "{s} · {d}", .{ util.clipUtf8(e.name[0..e.name_len], 40), e.pid }) catch proc_label[0..0];
@@ -1458,6 +1476,15 @@ fn attach() void {
 }
 
 fn scanWorker() void {
+    if (job.keep_undo) {
+        // The worker owns `sc` while busy, so the UI thread never sees a half copy.
+        job.undo.copyFrom(gpa, &sc) catch |e| {
+            job.err = @errorName(e);
+            finishJob();
+            return;
+        };
+        job.undo_ready = true;
+    }
     if (job.first) {
         sc.first(gpa, job.p, job.kind, job.cond, job.writable, .{}, job.kind.size(), 0) catch |e| {
             job.err = @errorName(e);
@@ -1465,6 +1492,10 @@ fn scanWorker() void {
     } else {
         job.canceled = sc.next(job.p, job.cond);
     }
+    finishJob();
+}
+
+fn finishJob() void {
     busy.store(false, .release);
     _ = PostMessageW(main_wnd, WM_SCAN_DONE, 0, 0);
 }
@@ -1521,7 +1552,7 @@ fn doScan(first: bool) void {
     var cond: scan.Cond = .{ .mode = mode };
 
     const needs_value = switch (mode) {
-        .exact, .greater, .less, .between => true,
+        .exact, .greater, .less, .between, .delta => true,
         else => false,
     };
     if (needs_value) {
@@ -1560,6 +1591,7 @@ fn doScan(first: bool) void {
         .p = p,
         .err = null,
         .canceled = false,
+        .keep_undo = scan_active,
     };
     startJob();
 }
@@ -1570,6 +1602,15 @@ fn onScanDone() void {
     _ = busy.load(.acquire);
     _ = KillTimer(main_wnd, TIMER_PROGRESS);
     show(ui.cancel, false);
+    if (job.undo_ready) {
+        undo_sc.deinit(gpa);
+        undo_sc = job.undo;
+        job.undo = .{};
+        undo_active = true;
+    } else {
+        job.undo.deinit(gpa);
+        job.undo = .{};
+    }
     if (job.err == null and job.first) scan_active = true;
     updateResults();
     if (job.err == null) {
@@ -1594,12 +1635,37 @@ fn onScanDone() void {
 }
 
 fn doReset() void {
+    if (scan_active) {
+        undo_sc.deinit(gpa);
+        undo_sc = sc;
+        sc = .{};
+        undo_active = true;
+    } else {
+        sc.deinit(gpa);
+        sc = .{};
+    }
     scan_active = false;
-    sc.deinit(gpa);
-    sc = .{};
     clearResultsCache();
     updateResults();
-    setStatus("Results cleared — you can start a new scan", .{});
+    syncControls();
+    setStatus("Results cleared — press Undo to bring them back", .{});
+}
+
+fn doUndo() void {
+    if (!undo_active) {
+        setStatus("Nothing to undo", .{});
+        return;
+    }
+    sc.deinit(gpa);
+    sc = undo_sc;
+    undo_sc = .{};
+    undo_active = false;
+    scan_active = true;
+    clearResultsCache();
+    updateResults();
+    syncControls();
+    if (proc != null) _ = refreshResultsValues();
+    setStatus("Restored the previous result set: {d} addresses", .{sc.matches.items.len});
 }
 
 fn selectedMatch() ?usize {
@@ -1845,6 +1911,7 @@ fn createControls(p: HWND) !void {
 
     ui.btn_first = try button(p, L("First Scan"), b_first, ID_FIRST);
     ui.btn_next = try button(p, L("Next Scan"), b_next, ID_NEXT);
+    ui.btn_undo = try button(p, L("Undo"), b_undo, ID_UNDO);
     ui.btn_reset = try button(p, L("Reset"), b_reset, ID_RESET);
     ui.value = try edit(p, b_value_full, ID_VALUE, 62);
     ui.value2 = try edit(p, b_value2, ID_VALUE2, 26);
@@ -1909,7 +1976,7 @@ fn onCommand(id: usize, code: usize) void {
     }
 
     const heavy = switch (id) {
-        ID_PROCS, ID_FIRST, ID_NEXT, ID_RESET, ID_RESULTS => true,
+        ID_PROCS, ID_FIRST, ID_NEXT, ID_UNDO, ID_RESET, ID_RESULTS => true,
         else => false,
     };
     if (heavy and busy.load(.acquire)) {
@@ -1931,6 +1998,7 @@ fn onCommand(id: usize, code: usize) void {
         ID_DD_COND => openPopup(.cond),
         ID_FIRST => doScan(true),
         ID_NEXT => doScan(false),
+        ID_UNDO => doUndo(),
         ID_RESET => {
             if (scan_active) doReset();
         },
@@ -2055,6 +2123,9 @@ fn wndProc(hwnd: HWND, msg: u32, wp: usize, lp: isize) callconv(.winapi) isize {
                 proc = null;
             }
             releaseBackBuffer();
+            sc.deinit(gpa);
+            undo_sc.deinit(gpa);
+            job.undo.deinit(gpa);
             if (br_bg) |b| _ = DeleteObject(b);
             if (br_card) |b| _ = DeleteObject(b);
             if (br_field) |b| _ = DeleteObject(b);

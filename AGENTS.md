@@ -53,6 +53,10 @@ the output is a repeatable MiB/s figure, not a pass/fail check.
   The file format starts with a magic (`ZCS4`, legacy `ZCS3` and `ZCS2` are still
   readable). Change the layout only together with a new magic and, where possible, a
   decoder for the old one.
+- The undo history is a `ZSN1` snapshot at `<name>.session.undo`, written before
+  `scan first`, `scan next`, `scan reset`, and `scan snapshot load`; `scan undo` consumes
+  it once. `serve` keeps the same snapshot in memory. Snapshots store the match list,
+  type, encoding, truncation flag, and target identity, never the address table.
 - A session stores the target's creation time; a restarted PID must fail with
   `StaleSession`, not silently reuse results.
 - `serve` reads one command per line from stdin and keeps state in memory.

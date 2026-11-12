@@ -25,6 +25,7 @@ function Invoke-Cli {
 
 $session = "smoke-$PID"
 $tableFile = Join-Path $env:TEMP "memfract-smoke-$PID.txt"
+$snapFile = Join-Path $env:TEMP "memfract-smoke-$PID.zsn"
 $sessionFile = Join-Path $env:TEMP "memfract\$session.session"
 $fixtureProc = $null
 
@@ -66,6 +67,14 @@ try {
     $read = Invoke-Cli read --addr $addr --type int32 --session $session
     if ($read.value -ne 305419897) { throw "read returned $($read.value), expected 305419897" }
 
+    $delta = Invoke-Cli scan next --cond delta --value 1 --session $session
+    if ($delta.count -ne 1) { throw "delta filter left $($delta.count) addresses instead of 1" }
+
+    $snap = Invoke-Cli scan snapshot save --file $snapFile --session $session
+    if ($snap.count -ne 1 -or $snap.type -ne 'int32') {
+        throw "snapshot save returned $($snap | ConvertTo-Json -Compress)"
+    }
+
     $next = Invoke-Cli scan next --cond exact --value 305419897 --session $session
     if ($next.count -ne 1) { throw "scan next left $($next.count) addresses instead of 1" }
 
@@ -94,6 +103,20 @@ try {
     $sigNext = Invoke-Cli scan next --cond unchanged --session $session
     if ($sigNext.count -lt 1) { throw "unchanged filter dropped every byte-pattern match" }
 
+    $reloaded = Invoke-Cli scan snapshot load --file $snapFile --session $session
+    if ($reloaded.count -ne 1 -or $reloaded.type -ne 'int32') {
+        throw "snapshot load returned $($reloaded | ConvertTo-Json -Compress)"
+    }
+    $status = Invoke-Cli scan status --session $session
+    if (-not $status.can_undo) { throw "snapshot load did not keep an undo step" }
+
+    $undone = Invoke-Cli scan undo --session $session
+    if (-not $undone.undone -or $undone.count -ne $sigNext.count) {
+        throw "undo returned $($undone | ConvertTo-Json -Compress), expected $($sigNext.count) addresses"
+    }
+    $status = Invoke-Cli scan status --session $session
+    if ($status.can_undo) { throw "undo history was not consumed" }
+
     $detached = Invoke-Cli detach --session $session
     if (-not $detached.detached) { throw "detach failed" }
 
@@ -102,5 +125,5 @@ try {
     if ($fixtureProc -and -not $fixtureProc.HasExited) {
         Stop-Process -Id $fixtureProc.Id -Force -ErrorAction SilentlyContinue
     }
-    Remove-Item -Force $sessionFile, $tableFile -ErrorAction SilentlyContinue
+    Remove-Item -Force $sessionFile, "$sessionFile.undo", $tableFile, $snapFile -ErrorAction SilentlyContinue
 }
