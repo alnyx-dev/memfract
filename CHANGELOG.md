@@ -5,6 +5,32 @@ and versions follow the `DEPTH.ITERATION` scheme described in `AGENTS.md`.
 
 ## [Unreleased]
 
+## [1.5] — 2026-11-12
+
+### Added
+
+- `scan first --threads N` sets the worker count (default: the CPU count).
+- Scan responses include `regions_scanned` and `bytes_read` next to `elapsed_ms`, so
+  scripts can measure how much memory a filter actually touched.
+- `zig build bench` runs a benchmark over synthetic regions: aligned and unaligned
+  scans, `scan next`, throughput in MiB/s, and a match-count check against a scalar
+  reference pass.
+
+### Changed
+
+- First scans split the scanned address range into contiguous groups, read memory on
+  all CPU cores, and merge the groups back in address order. Results stay sorted and
+  identical to a single-threaded scan; the worker count only affects speed.
+- Workers share one match budget (16,000,000 matches), so `truncated` still keeps
+  memory use bounded on very dense scans.
+- `scan next` reads nearby matches through shared windows of up to 64 KB instead of one
+  4 KB page per call, which cuts `ReadProcessMemory` calls on dense result sets.
+
+### Performance
+
+- Aligned `exact` scans for integer types compare 16 bytes at a time with SIMD; unaligned
+  scans keep the byte-by-byte path.
+
 ## [1.4] — 2026-11-11
 
 ### Added
