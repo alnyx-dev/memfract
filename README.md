@@ -106,9 +106,12 @@ For a series of commands, use `serve`:
 
 ## GUI
 
-Run `zig-out\bin\memfract-gui.exe` as administrator. The scanner and address table share one window:
-select a process, search, refine, freeze, and write values. The table is saved to `memfract_table.txt`
-next to the executable or in the current directory.
+Run `zig-out\bin\memfract-gui.exe` as administrator. The scanner and address table share one window
+with three areas: a results list, a scan panel, and a saved-address table. Pick a process at the top,
+enter a value, and press First Scan, then refine with Next. Double-click a result to add it to the
+table; double-click a table row to freeze it. `Save` and `Load` in the table header use
+`memfract_table.txt` next to the executable or in the current directory, and `Theme` switches
+light/dark instantly. Closing the window during a scan cancels it and exits cleanly.
 
 ## Project layout
 

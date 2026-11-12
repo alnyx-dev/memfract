@@ -107,8 +107,6 @@ extern "user32" fn GetClientRect(h: HWND, rc: *RECT) callconv(.winapi) i32;
 extern "user32" fn InvalidateRect(h: ?HWND, rc: ?*const RECT, erase: i32) callconv(.winapi) i32;
 extern "user32" fn FillRect(dc: HDC, rc: *const RECT, br: *anyopaque) callconv(.winapi) i32;
 extern "user32" fn DrawTextW(dc: HDC, s: [*]const u16, n: i32, rc: *RECT, flags: u32) callconv(.winapi) i32;
-extern "user32" fn GetCursorPos(pt: *POINT) callconv(.winapi) i32;
-extern "user32" fn WindowFromPoint(pt: POINT) callconv(.winapi) ?HWND;
 extern "user32" fn AdjustWindowRect(rc: *RECT, style: u32, menu: i32) callconv(.winapi) i32;
 extern "user32" fn GetDpiForSystem() callconv(.winapi) u32;
 extern "user32" fn GetSystemMetrics(i: i32) callconv(.winapi) i32;
@@ -116,11 +114,11 @@ extern "user32" fn SetProcessDPIAware() callconv(.winapi) i32;
 extern "user32" fn MoveWindow(h: HWND, x: i32, y: i32, w: i32, hh: i32, repaint: i32) callconv(.winapi) i32;
 extern "user32" fn SetFocus(h: HWND) callconv(.winapi) ?HWND;
 extern "user32" fn BringWindowToTop(h: HWND) callconv(.winapi) i32;
-extern "user32" fn ScreenToClient(h: HWND, pt: *POINT) callconv(.winapi) i32;
 extern "user32" fn RedrawWindow(h: HWND, rc: ?*const RECT, rgn: ?*anyopaque, flags: u32) callconv(.winapi) i32;
+extern "user32" fn EnableWindow(h: HWND, enable: i32) callconv(.winapi) i32;
+extern "user32" fn IsWindowEnabled(h: HWND) callconv(.winapi) i32;
+extern "user32" fn DestroyWindow(h: HWND) callconv(.winapi) i32;
 extern "kernel32" fn GetModuleHandleW(name: ?[*:0]const u16) callconv(.winapi) ?HINSTANCE;
-extern "kernel32" fn CreateThread(attr: ?*anyopaque, stack: usize, start: *const fn (?*anyopaque) callconv(.winapi) u32, param: ?*anyopaque, flags: u32, id: ?*u32) callconv(.winapi) ?*anyopaque;
-extern "kernel32" fn CloseHandle(h: *anyopaque) callconv(.winapi) i32;
 extern "kernel32" fn GetTickCount64() callconv(.winapi) u64;
 extern "gdi32" fn CreateSolidBrush(c: u32) callconv(.winapi) ?*anyopaque;
 extern "gdi32" fn DeleteObject(o: *anyopaque) callconv(.winapi) i32;
@@ -156,7 +154,9 @@ extern "advapi32" fn RegGetValueW(key: usize, sub: [*:0]const u16, value: [*:0]c
 const WM_CREATE = 0x0001;
 const WM_DESTROY = 0x0002;
 const WM_SIZE = 0x0005;
+const WM_SETREDRAW = 0x000B;
 const WM_PAINT = 0x000F;
+const WM_CLOSE = 0x0010;
 const WM_ERASEBKGND = 0x0014;
 const WM_GETMINMAXINFO = 0x0024;
 const WM_SETFONT = 0x0030;
@@ -194,7 +194,6 @@ const LB_SETCURSEL = 0x186;
 const LB_GETCURSEL = 0x188;
 const LB_GETTOPINDEX = 0x18E;
 const LB_SETCOUNT = 0x1A7;
-const LB_ITEMFROMPOINT = 0x1A9;
 const LBN_SELCHANGE = 1;
 const LBN_DBLCLK = 2;
 const LBN_KILLFOCUS = 5;
@@ -313,8 +312,10 @@ const min_client_h = 620;
 var lw: i32 = client_w;
 var lh: i32 = client_h;
 
-var b_pill: Box = bx(150, 12, 300, 32);
-var b_more: Box = bx(900, 12, 44, 32);
+var b_pill: Box = bx(150, 12, 500, 32);
+var b_save: Box = bx(700, 12, 72, 32);
+var b_load: Box = bx(780, 12, 72, 32);
+var b_theme: Box = bx(860, 12, 72, 32);
 
 var b_card_pick: Box = bx(16, 60, 928, 600);
 var b_filter: Box = bx(32, 76, 896, 36);
@@ -355,14 +356,15 @@ fn layout() void {
     const margin: i32 = 16;
     const gap: i32 = 16;
     const header_y: i32 = 60;
-    const top_h: i32 = 320;
+    const top_h: i32 = 300;
     const footer_h: i32 = 36;
     const footer_y = lh - footer_h;
     const content_bottom = footer_y - 4;
     const inner_w = lw - margin * 2;
 
-    b_pill = bx(150, 12, 300, 32);
-    b_more = bx(lw - 60, 12, 44, 32);
+    const header_btn_w: i32 = 72;
+    b_theme = bx(lw - margin - header_btn_w, 12, header_btn_w, 32);
+    b_pill = bx(150, 12, b_theme.x - 8 - 150, 32);
 
     const res_w = @divTrunc((inner_w - gap) * 440, 912);
     const scan_x = margin + res_w + gap;
@@ -371,6 +373,8 @@ fn layout() void {
     b_card_res = bx(margin, header_y, res_w, top_h);
     b_card_scan = bx(scan_x, header_y, scan_w, top_h);
     b_card_tbl = bx(margin, header_y + top_h + 8, inner_w, content_bottom - (header_y + top_h + 8));
+    b_save = bx(b_card_tbl.x + b_card_tbl.w - 16 - 64, b_card_tbl.y + 8, 64, 24);
+    b_load = bx(b_save.x - 8 - 64, b_card_tbl.y + 8, 64, 24);
 
     b_results = bx(b_card_res.x + 16, b_card_res.y + 58, b_card_res.w - 32, b_card_res.h - 74);
 
@@ -396,7 +400,7 @@ fn layout() void {
     b_write = bx(b_freeze.x - 8 - 100, form_y, 100, 36);
     b_newval = bx(b_write.x - 8 - 200, form_y, 200, 36);
     b_desc = bx(b_card_tbl.x + 16, form_y, b_newval.x - 8 - (b_card_tbl.x + 16), 36);
-    b_table = bx(b_card_tbl.x + 16, b_card_tbl.y + 32, b_card_tbl.w - 32, form_y - 10 - (b_card_tbl.y + 32));
+    b_table = bx(b_card_tbl.x + 16, b_card_tbl.y + 58, b_card_tbl.w - 32, form_y - 10 - (b_card_tbl.y + 58));
 
     b_card_pick = bx(margin, header_y, inner_w, content_bottom - header_y);
     b_filter = bx(b_card_pick.x + 16, b_card_pick.y + 16, b_card_pick.w - 32, 36);
@@ -425,18 +429,19 @@ const ID_WRITE: usize = 15;
 const ID_FREEZE: usize = 16;
 const ID_DELETE: usize = 17;
 const ID_PILL: usize = 18;
-const ID_MORE: usize = 19;
+const ID_THEME: usize = 19;
 const ID_CANCEL: usize = 20;
 const ID_POPUP: usize = 21;
 const ID_PICK_CLOSE: usize = 22;
+const ID_SAVE: usize = 23;
+const ID_LOAD: usize = 24;
 
 const TIMER_FREEZE: usize = 1;
-const TIMER_HOVER: usize = 2;
-const TIMER_LIVE: usize = 3;
-const TIMER_PROGRESS: usize = 4;
-const TIMER_ANIM: usize = 5;
+const TIMER_LIVE: usize = 2;
+const TIMER_PROGRESS: usize = 3;
+const TIMER_FILTER: usize = 4;
 
-const PopupKind = enum { none, type, cond, menu };
+const PopupKind = enum { none, type, cond };
 
 const first_modes = [_]scan.Mode{ .exact, .greater, .less, .between, .unknown };
 const next_modes = [_]scan.Mode{ .exact, .greater, .less, .between, .changed, .unchanged, .increased, .decreased };
@@ -449,7 +454,9 @@ fn kindIndex(kind: scan.Kind) usize {
 
 const Ui = struct {
     pill: HWND,
-    more: HWND,
+    save: HWND,
+    load: HWND,
+    theme: HWND,
     filter: HWND,
     procs: HWND,
     pick_close: HWND,
@@ -510,30 +517,18 @@ var popup_kind: PopupKind = .none;
 var popup_items: [10][]const u8 = undefined;
 var popup_n: usize = 0;
 var popup_cur: usize = std.math.maxInt(usize);
-var popup_hot: usize = std.math.maxInt(usize);
 var popup_rc: Box = .{ .x = 0, .y = 0, .w = 0, .h = 0 };
 var popup_cond_list: [8]scan.Mode = undefined;
 var popup_closed_kind: PopupKind = .none;
 var popup_closed_at: u64 = 0;
 
 var ui_ready = false;
-var anim_on = false;
 
-var anim_btns: [24]HWND = undefined;
-var anim_hot: [24]i32 = undefined;
-var anim_n: usize = 0;
-var hover_tick_at: u64 = 0;
-
-var prog_shown: i32 = 0;
-
-var theme_from: Palette = dark_pal;
-var theme_to: Palette = dark_pal;
-var theme_t0: u64 = 0;
-var theme_anim = false;
-
-var popup_anim = false;
-var popup_anim_t0: u64 = 0;
-var popup_final_y: i32 = 0;
+var back_dc: ?HDC = null;
+var back_bmp: ?*anyopaque = null;
+var back_old: ?*anyopaque = null;
+var back_w: i32 = 0;
+var back_h: i32 = 0;
 
 var proc: ?win.Process = null;
 var proc_label: [96]u8 = undefined;
@@ -543,6 +538,7 @@ var procs: std.ArrayList(win.ProcEntry) = .empty;
 var table: std.ArrayList(Row) = .empty;
 
 var busy = std.atomic.Value(bool).init(false);
+var scan_thread: ?std.Thread = null;
 var job: Job = undefined;
 var job_start: u64 = 0;
 
@@ -553,7 +549,6 @@ var res_cache_idx: [cache_cap]usize = std.mem.zeroes([cache_cap]usize);
 var res_cache_len: [cache_cap]usize = std.mem.zeroes([cache_cap]usize);
 var res_cache_text: [cache_cap][48]u8 = std.mem.zeroes([cache_cap][48]u8);
 var res_cache_filled: [cache_cap]bool = std.mem.zeroes([cache_cap]bool);
-var res_cache_top: usize = std.math.maxInt(usize);
 
 var status_buf: [256]u8 = undefined;
 var status_len: usize = 0;
@@ -643,6 +638,11 @@ fn drawCard(hdc: HDC, b: Box) void {
     rrect(hdc, s.x, s.y, s.w, s.h, S(12), pal.card, pal.card_border);
 }
 
+fn drawFrame(hdc: HDC, b: Box) void {
+    const s = sbox(b);
+    rrect(hdc, s.x - 1, s.y - 1, s.w + 2, s.h + 2, S(7), null, pal.field_border);
+}
+
 fn drawField(hdc: HDC, b: Box, id: usize, caption: []const u8) void {
     const s = sbox(b);
     rrect(hdc, s.x, s.y, s.w, s.h, S(8), pal.field, pal.field_border);
@@ -674,6 +674,37 @@ fn valueBox() Box {
     return if (cond_mode == .between) b_value_half else b_value_full;
 }
 
+fn releaseBackBuffer() void {
+    if (back_dc) |dc| {
+        if (back_old) |o| _ = SelectObject(dc, o);
+        _ = DeleteDC(dc);
+    }
+    if (back_bmp) |bmp| _ = DeleteObject(bmp);
+    back_dc = null;
+    back_bmp = null;
+    back_old = null;
+    back_w = 0;
+    back_h = 0;
+}
+
+fn ensureBackBuffer(hdc: HDC, w: i32, h: i32) ?HDC {
+    if (back_dc) |dc| {
+        if (back_w == w and back_h == h) return dc;
+    }
+    releaseBackBuffer();
+    const dc = CreateCompatibleDC(hdc) orelse return null;
+    const bmp = CreateCompatibleBitmap(hdc, w, h) orelse {
+        _ = DeleteDC(dc);
+        return null;
+    };
+    back_old = SelectObject(dc, bmp);
+    back_dc = dc;
+    back_bmp = bmp;
+    back_w = w;
+    back_h = h;
+    return dc;
+}
+
 fn paintMain(hwnd: HWND) void {
     var ps: PAINTSTRUCT = undefined;
     const hdc = BeginPaint(hwnd, &ps) orelse return;
@@ -685,14 +716,7 @@ fn paintMain(hwnd: HWND) void {
     const h = rc.bottom;
     if (w < 2 or h < 2) return;
 
-    const mdc = CreateCompatibleDC(hdc) orelse return;
-    defer _ = DeleteDC(mdc);
-    const bmp = CreateCompatibleBitmap(hdc, w, h) orelse return;
-    defer _ = DeleteObject(bmp);
-    const old = SelectObject(mdc, bmp);
-    defer if (old) |o| {
-        _ = SelectObject(mdc, o);
-    };
+    const mdc = ensureBackBuffer(hdc, w, h) orelse return;
 
     if (br_bg) |b| _ = FillRect(mdc, &rc, b);
 
@@ -702,12 +726,14 @@ fn paintMain(hwnd: HWND) void {
 
     if (picker) {
         drawCard(mdc, b_card_pick);
+        drawFrame(mdc, b_procs);
         drawField(mdc, b_filter, ID_FILTER, "Search");
-        note(mdc, "Double-click a process to attach", b_card_pick.x + 16, b_card_pick.y + b_card_pick.h - 38, b_card_pick.w - 32);
     } else {
         drawCard(mdc, b_card_res);
         drawCard(mdc, b_card_scan);
         drawCard(mdc, b_card_tbl);
+        drawFrame(mdc, b_results);
+        drawFrame(mdc, b_table);
 
         var cb: [64]u8 = undefined;
         const found_s: []const u8 = if (busy_now)
@@ -724,15 +750,15 @@ fn paintMain(hwnd: HWND) void {
         if (cond_mode == .between) drawField(mdc, b_value2, ID_VALUE2, "To");
         note(mdc, "Condition", b_card_scan.x + 16, b_card_scan.y + 118, 200);
         note(mdc, "Value type", b_dd_type.x, b_card_scan.y + 118, b_dd_type.w);
-        note(mdc, "Double-click an address on the left to add it to the table.", b_card_scan.x + 16, b_card_scan.y + 232, b_card_scan.w - 32);
-        note(mdc, "Double-click a table row to freeze / unfreeze it.", b_card_scan.x + 16, b_card_scan.y + 252, b_card_scan.w - 32);
+        note(mdc, "Double-click a result to add it, or a table row to freeze it.", b_card_scan.x + 16, b_card_scan.y + 232, b_card_scan.w - 32);
 
         const tw = b_table.w;
-        note(mdc, "On", b_table.x + @divTrunc(tw * 20, 896), b_card_tbl.y + 10, 50);
-        note(mdc, "Description", b_table.x + @divTrunc(tw * 64, 896), b_card_tbl.y + 10, 200);
-        note(mdc, "Address", b_table.x + @divTrunc(tw * 364, 896), b_card_tbl.y + 10, 150);
-        note(mdc, "Type", b_table.x + @divTrunc(tw * 564, 896), b_card_tbl.y + 10, 80);
-        note(mdc, "Value", b_table.x + @divTrunc(tw * 664, 896), b_card_tbl.y + 10, 150);
+        text(mdc, f_semi, pal.text, "Saved addresses", S(b_card_tbl.x + 16), S(b_card_tbl.y + 10), S(240), S(24), DT_V);
+        note(mdc, "On", b_table.x + @divTrunc(tw * 20, 896), b_card_tbl.y + 38, 50);
+        note(mdc, "Description", b_table.x + @divTrunc(tw * 64, 896), b_card_tbl.y + 38, 200);
+        note(mdc, "Address", b_table.x + @divTrunc(tw * 364, 896), b_card_tbl.y + 38, 150);
+        note(mdc, "Type", b_table.x + @divTrunc(tw * 564, 896), b_card_tbl.y + 38, 80);
+        note(mdc, "Value", b_table.x + @divTrunc(tw * 664, 896), b_card_tbl.y + 38, 150);
         drawField(mdc, b_desc, ID_DESC, "Description");
         drawField(mdc, b_newval, ID_NEWVAL, "Value");
     }
@@ -742,11 +768,12 @@ fn paintMain(hwnd: HWND) void {
     }
 
     const fy = S(b_footer.y);
-    rrect(mdc, S(22), fy + S(14), S(8), S(8), S(4), if (busy_now) pal.accent else pal.good, null);
+    const dot = if (busy_now) pal.accent else if (proc != null) pal.good else pal.text2;
+    rrect(mdc, S(22), fy + S(14), S(8), S(8), S(4), dot, null);
     const status_w = if (busy_now) S(@max(220, lw - 440)) else S(lw - 180);
     text(mdc, f_body, pal.text2, status_buf[0..status_len], S(38), fy + S(4), status_w, S(28), DT_V);
     if (busy_now) {
-        const pr: i32 = prog_shown;
+        const pr: i32 = @intCast(scan.progress.load(.acquire));
         const bw = S(200);
         const bxx = S(lw - 400);
         const byy = fy + S(15);
@@ -758,7 +785,10 @@ fn paintMain(hwnd: HWND) void {
         text(mdc, f_small, pal.text2, pct, S(lw - 192), fy + S(4), S(50), S(28), DT_V);
     }
 
-    _ = BitBlt(hdc, 0, 0, w, h, mdc, 0, 0, 0x00CC0020);
+    const dr = ps.rcPaint;
+    const dw = dr.right - dr.left;
+    const dh = dr.bottom - dr.top;
+    if (dw > 0 and dh > 0) _ = BitBlt(hdc, dr.left, dr.top, dw, dh, mdc, dr.left, dr.top, 0x00CC0020);
 }
 
 const BtnStyle = enum { accent, normal, dropdown, pill, check };
@@ -766,7 +796,7 @@ const BtnStyle = enum { accent, normal, dropdown, pill, check };
 fn styleOf(id: usize) BtnStyle {
     return switch (id) {
         ID_FIRST, ID_WRITE => .accent,
-        ID_DD_TYPE, ID_DD_COND, ID_MORE => .dropdown,
+        ID_DD_TYPE, ID_DD_COND => .dropdown,
         ID_PILL => .pill,
         ID_WRITABLE => .check,
         else => .normal,
@@ -775,16 +805,9 @@ fn styleOf(id: usize) BtnStyle {
 
 fn onBackground(id: usize) bool {
     return switch (id) {
-        ID_PILL, ID_MORE, ID_CANCEL => true,
+        ID_PILL, ID_SAVE, ID_LOAD, ID_THEME, ID_CANCEL => true,
         else => false,
     };
-}
-
-fn hoverAmount(h: HWND) i32 {
-    for (anim_btns[0..anim_n], 0..) |bh, i| {
-        if (bh == h) return anim_hot[i];
-    }
-    return 0;
 }
 
 fn drawButton(di: *const DRAWITEMSTRUCT) void {
@@ -825,10 +848,8 @@ fn drawButtonContent(di: *const DRAWITEMSTRUCT) void {
     const w = rc.right - rc.left;
     const h = rc.bottom - rc.top;
     const hdc = di.hDC;
-    const disabled = (id == ID_NEXT or id == ID_RESET) and !scan_active;
+    const disabled = IsWindowEnabled(di.hwndItem) == 0;
     const pressed = (di.itemState & 1) != 0 and !disabled;
-    const hv: i32 = if (disabled) 0 else hoverAmount(di.hwndItem);
-    const hot = hv > 50;
     const st = styleOf(id);
 
     fillRgb(hdc, rc, if (onBackground(id)) pal.bg else pal.card);
@@ -841,7 +862,7 @@ fn drawButtonContent(di: *const DRAWITEMSTRUCT) void {
         const by = rc.top + @divTrunc(h - bsz, 2);
         rrect(hdc, rc.left + S(2), by, bsz, bsz, S(6), if (writable_only) pal.accent else pal.field, if (writable_only) null else pal.field_border);
         if (writable_only) text(hdc, f_semi, pal.on_accent, "✓", rc.left + S(2), by, bsz, bsz, DT_V | DT_CENTER);
-        text(hdc, f_body, if (hot) pal.text else pal.text2, label_s, rc.left + S(32), rc.top, w - S(32), h, DT_V);
+        text(hdc, f_body, if (disabled) pal.text2 else pal.text, label_s, rc.left + S(32), rc.top, w - S(32), h, DT_V);
         return;
     }
 
@@ -856,12 +877,6 @@ fn drawButtonContent(di: *const DRAWITEMSTRUCT) void {
             fg = pal.on_accent;
         },
         .pill => radius = @divTrunc(h, 2),
-        .dropdown => {
-            if (id == ID_MORE) {
-                fill = pal.bg;
-                border = null;
-            }
-        },
         else => {},
     }
     if (id == ID_CANCEL) {
@@ -869,11 +884,9 @@ fn drawButtonContent(di: *const DRAWITEMSTRUCT) void {
     }
     if (disabled) {
         fg = pal.text2;
-        fill = pal.card;
+        fill = if (st == .accent) mix(pal.accent, pal.card, 72) else pal.card;
     } else if (pressed) {
         fill = mix(fill, pal.bg, 35);
-    } else if (hv > 0) {
-        fill = mixRatio(fill, pal.text, @intCast(8 * hv), 10000);
     }
 
     rrect(hdc, rc.left, rc.top, w, h, radius, fill, border);
@@ -882,7 +895,7 @@ fn drawButtonContent(di: *const DRAWITEMSTRUCT) void {
         const dot = if (proc != null) pal.good else pal.text2;
         rrect(hdc, rc.left + S(16), rc.top + @divTrunc(h - S(8), 2), S(8), S(8), S(4), dot, null);
         text(hdc, f_semi, fg, label_s, rc.left + S(32), rc.top, w - S(44), h, DT_V);
-    } else if (st == .dropdown and id != ID_MORE) {
+    } else if (st == .dropdown) {
         const expanded = (id == ID_DD_TYPE and popup_kind == .type) or (id == ID_DD_COND and popup_kind == .cond);
         if (expanded) rrect(hdc, rc.left, rc.top, w, h, radius, null, pal.accent);
         text(hdc, f_body, fg, label_s, rc.left + S(14), rc.top, w - S(48), h, DT_V);
@@ -976,7 +989,7 @@ fn drawListItemContent(di: *const DRAWITEMSTRUCT) void {
     } else if (id == ID_POPUP) {
         if (idx >= popup_n) return;
         const current = idx == popup_cur;
-        if (idx == popup_hot or (di.itemState & 1) != 0) {
+        if ((di.itemState & 1) != 0) {
             rrect(hdc, rc.left + S(4), rc.top + S(2), w - S(8), h - S(4), S(6), pal.sel, null);
         } else if (current) {
             rrect(hdc, rc.left + S(4), rc.top + S(2), w - S(8), h - S(4), S(6), mix(pal.card, pal.accent, 7), null);
@@ -1014,12 +1027,6 @@ fn popupDetail(idx: usize) []const u8 {
             .increased => "Higher than the previous scan",
             .decreased => "Lower than the previous scan",
         },
-        .menu => switch (idx) {
-            0 => "Change the interface appearance",
-            1 => "Export your saved addresses",
-            2 => "Restore addresses from a file",
-            else => "",
-        },
     };
 }
 
@@ -1056,39 +1063,11 @@ fn edit(parent: HWND, field: Box, id: usize, capw: i32) !HWND {
 }
 
 fn button(parent: HWND, caption_w: [*:0]const u16, b: Box, id: usize) !HWND {
-    const h = try child(parent, L("BUTTON"), caption_w, BS_OWNERDRAW | WS_TABSTOP, b, id);
-    if (anim_n < anim_btns.len) {
-        anim_btns[anim_n] = h;
-        anim_hot[anim_n] = 0;
-        anim_n += 1;
-    }
-    return h;
+    return child(parent, L("BUTTON"), caption_w, BS_OWNERDRAW | WS_TABSTOP, b, id);
 }
 
 fn mkFont(height: i32, weight: i32, face: [*:0]const u16) !*anyopaque {
     return CreateFontW(-S(height), 0, 0, 0, weight, 0, 0, 0, 1, 0, 0, 5, 0, face) orelse error.FontFailed;
-}
-
-fn mixPalette(a: Palette, b: Palette, t: u32) Palette {
-    return .{
-        .bg = mix(a.bg, b.bg, t),
-        .card = mix(a.card, b.card, t),
-        .card_border = mix(a.card_border, b.card_border, t),
-        .field = mix(a.field, b.field, t),
-        .field_border = mix(a.field_border, b.field_border, t),
-        .text = mix(a.text, b.text, t),
-        .text2 = mix(a.text2, b.text2, t),
-        .accent = mix(a.accent, b.accent, t),
-        .on_accent = mix(a.on_accent, b.on_accent, t),
-        .btn = mix(a.btn, b.btn, t),
-        .btn_border = mix(a.btn_border, b.btn_border, t),
-        .sel = mix(a.sel, b.sel, t),
-        .good = mix(a.good, b.good, t),
-    };
-}
-
-fn smooth(t: f32) f32 {
-    return t * t * (3.0 - 2.0 * t);
 }
 
 fn rebuildBrushes() void {
@@ -1103,9 +1082,9 @@ fn rebuildBrushes() void {
 fn applyThemeChrome() void {
     const d: i32 = if (dark_mode) 1 else 0;
     _ = DwmSetWindowAttribute(main_wnd, 20, &d, 4);
-    const cap: u32 = cr(theme_to.bg);
+    const cap: u32 = cr(pal.bg);
     _ = DwmSetWindowAttribute(main_wnd, 35, &cap, 4);
-    const txt: u32 = cr(theme_to.text);
+    const txt: u32 = cr(pal.text);
     _ = DwmSetWindowAttribute(main_wnd, 36, &txt, 4);
 
     const theme = if (dark_mode) L("DarkMode_Explorer") else L("Explorer");
@@ -1115,51 +1094,11 @@ fn applyThemeChrome() void {
 }
 
 fn applyTheme() void {
-    theme_from = pal;
-    theme_to = if (dark_mode) dark_pal else light_pal;
-    theme_t0 = GetTickCount64();
-    theme_anim = true;
-    syncAnimTimer();
+    closePopup();
+    pal = if (dark_mode) dark_pal else light_pal;
+    rebuildBrushes();
     applyThemeChrome();
-}
-
-fn syncAnimTimer() void {
-    if (theme_anim or popup_anim) {
-        if (!anim_on) {
-            _ = SetTimer(main_wnd, TIMER_ANIM, 16, null);
-            anim_on = true;
-        }
-    } else if (anim_on) {
-        _ = KillTimer(main_wnd, TIMER_ANIM);
-        anim_on = false;
-    }
-}
-
-fn animTick() void {
-    const now = GetTickCount64();
-
-    if (theme_anim) {
-        const t: f32 = @min(1.0, @as(f32, @floatFromInt(now - theme_t0)) / 220.0);
-        const e = smooth(t);
-        pal = mixPalette(theme_from, theme_to, @intFromFloat(e * 100.0));
-        rebuildBrushes();
-        _ = RedrawWindow(main_wnd, null, null, 0x85);
-        if (t >= 1.0) theme_anim = false;
-    }
-
-    if (popup_anim) {
-        const t = @min(1.0, @as(f32, @floatFromInt(now - popup_anim_t0)) / 140.0);
-        const off: i32 = @intFromFloat((1.0 - smooth(t)) * 8.0);
-        popup_rc.y = popup_final_y + off;
-        _ = MoveWindow(ui.popup, popup_rc.x, popup_rc.y, popup_rc.w, popup_rc.h, 1);
-        _ = InvalidateRect(main_wnd, null, 0);
-        if (t >= 1.0) {
-            popup_rc.y = popup_final_y;
-            popup_anim = false;
-        }
-    }
-
-    syncAnimTimer();
+    _ = RedrawWindow(main_wnd, null, null, 0x85);
 }
 
 fn systemUsesLightTheme() bool {
@@ -1186,23 +1125,25 @@ fn normalizeCond() void {
 }
 
 fn layoutValue() void {
-    const s = sbox(editRect(valueBox(), 62));
-    _ = MoveWindow(ui.value, s.x, s.y, s.w, s.h, 1);
+    moveBox(ui.value, editRect(valueBox(), 62));
     show(ui.value2, !picker and cond_mode == .between);
 }
 
 fn moveBox(h: HWND, b: Box) void {
     const s = sbox(b);
-    _ = MoveWindow(h, s.x, s.y, s.w, s.h, 1);
+    _ = MoveWindow(h, s.x, s.y, s.w, s.h, 0);
 }
 
 fn relayout() void {
     if (!ui_ready) return;
     closePopup();
+    _ = SendMessageW(main_wnd, WM_SETREDRAW, 0, 0);
     layout();
     moveBox(ui.pill, b_pill);
-    moveBox(ui.more, b_more);
-    moveBox(ui.filter, b_filter);
+    moveBox(ui.save, b_save);
+    moveBox(ui.load, b_load);
+    moveBox(ui.theme, b_theme);
+    moveBox(ui.filter, editRect(b_filter, 44));
     moveBox(ui.procs, b_procs);
     moveBox(ui.pick_close, b_pick_close);
     moveBox(ui.results, b_results);
@@ -1210,18 +1151,19 @@ fn relayout() void {
     moveBox(ui.btn_next, b_next);
     moveBox(ui.btn_reset, b_reset);
     layoutValue();
-    moveBox(ui.value2, b_value2);
+    moveBox(ui.value2, editRect(b_value2, 26));
     moveBox(ui.dd_cond, b_dd_cond);
     moveBox(ui.dd_type, b_dd_type);
     moveBox(ui.writable, b_writable);
     moveBox(ui.table, b_table);
-    moveBox(ui.desc, b_desc);
-    moveBox(ui.newval, b_newval);
+    moveBox(ui.desc, editRect(b_desc, 64));
+    moveBox(ui.newval, editRect(b_newval, 62));
     moveBox(ui.btn_write, b_write);
     moveBox(ui.btn_freeze, b_freeze);
     moveBox(ui.btn_delete, b_delete);
     moveBox(ui.cancel, b_cancel);
-    _ = InvalidateRect(main_wnd, null, 0);
+    _ = SendMessageW(main_wnd, WM_SETREDRAW, 1, 0);
+    _ = RedrawWindow(main_wnd, null, null, 0x85);
 }
 
 fn refreshLabels() void {
@@ -1230,12 +1172,32 @@ fn refreshLabels() void {
     setText(ui.dd_type, @tagName(kind));
     setText(ui.dd_cond, condLabel(cond_mode));
     layoutValue();
+    syncControls();
     _ = InvalidateRect(ui.btn_next, null, 0);
     _ = InvalidateRect(ui.btn_reset, null, 0);
     _ = InvalidateRect(main_wnd, null, 0);
 }
 
+fn setEnabled(h: HWND, on: bool) void {
+    _ = EnableWindow(h, if (on) 1 else 0);
+}
+
+fn syncControls() void {
+    if (!ui_ready) return;
+    const running = busy.load(.acquire);
+    const attached = proc != null;
+    setEnabled(ui.btn_first, !running);
+    setEnabled(ui.btn_next, !running and attached and scan_active);
+    setEnabled(ui.btn_reset, !running and attached and scan_active);
+    setEnabled(ui.pill, !running);
+    setEnabled(ui.cancel, running);
+}
+
 fn setPicker(on: bool) void {
+    if (on and busy.load(.acquire)) {
+        setStatus("Wait for the scan to finish", .{});
+        return;
+    }
     closePopup();
     picker = on;
     show(ui.filter, on);
@@ -1246,10 +1208,15 @@ fn setPicker(on: bool) void {
         ui.results,    ui.dd_type,    ui.dd_cond,   ui.value,
         ui.btn_first,  ui.btn_next,   ui.btn_reset, ui.writable,
         ui.table,      ui.desc,       ui.newval,    ui.btn_write,
-        ui.btn_freeze, ui.btn_delete,
+        ui.btn_freeze, ui.btn_delete, ui.save,      ui.load,
     };
     for (main_ctrls) |h| show(h, !on);
     show(ui.value2, !on and cond_mode == .between);
+    if (on) {
+        refreshProcs();
+        setStatus("Double-click a process to attach", .{});
+    }
+    syncControls();
     _ = InvalidateRect(main_wnd, null, 0);
 }
 
@@ -1258,9 +1225,6 @@ fn closePopup() void {
     popup_closed_kind = popup_kind;
     popup_closed_at = GetTickCount64();
     popup_kind = .none;
-    popup_hot = std.math.maxInt(usize);
-    popup_anim = false;
-    syncAnimTimer();
     show(ui.popup, false);
     _ = InvalidateRect(ui.dd_type, null, 0);
     _ = InvalidateRect(ui.dd_cond, null, 0);
@@ -1271,8 +1235,7 @@ fn openPopup(kind: PopupKind) void {
     if (kind == popup_closed_kind and GetTickCount64() - popup_closed_at < 250) return;
 
     var anchor: Box = b_dd_type;
-    var width: i32 = 280;
-    var right = false;
+    const width: i32 = 280;
     popup_cur = std.math.maxInt(usize);
 
     switch (kind) {
@@ -1294,33 +1257,19 @@ fn openPopup(kind: PopupKind) void {
             }
             popup_n = modes.len;
         },
-        .menu => {
-            anchor = b_more;
-            width = 280;
-            right = true;
-            popup_items[0] = if (dark_mode) "Light theme" else "Dark theme";
-            popup_items[1] = "Save address table";
-            popup_items[2] = "Load address table";
-            popup_n = 3;
-        },
     }
 
     popup_kind = kind;
-    popup_hot = std.math.maxInt(usize);
     const n: i32 = @intCast(popup_n);
     const w = S(width);
     const h = S(48) * n;
-    const x = if (right) S(anchor.x + anchor.w) - w else S(anchor.x);
+    const x = S(anchor.x);
     var client: RECT = undefined;
     _ = GetClientRect(main_wnd, &client);
     const y = @max(S(8), @min(S(anchor.y + anchor.h + 6), client.bottom - h - S(8)));
     popup_rc = .{ .x = x, .y = y, .w = w, .h = h };
-    popup_final_y = y;
-    popup_anim_t0 = GetTickCount64();
-    popup_anim = true;
-    syncAnimTimer();
 
-    _ = MoveWindow(ui.popup, x, y + S(8), w, h, 1);
+    _ = MoveWindow(ui.popup, x, y, w, h, 0);
     _ = SendMessageW(ui.popup, LB_SETCOUNT, popup_n, 0);
     _ = SendMessageW(ui.popup, LB_SETCURSEL, std.math.maxInt(usize), 0);
     show(ui.popup, true);
@@ -1350,37 +1299,12 @@ fn onPopupPick(idx: usize) void {
             cond_mode = popup_cond_list[idx];
             refreshLabels();
         },
-        .menu => switch (idx) {
-            0 => {
-                dark_mode = !dark_mode;
-                applyTheme();
-            },
-            1 => saveTable(),
-            2 => loadTable(),
-            else => {},
-        },
-    }
-}
-
-fn popupHoverTick() void {
-    if (popup_kind == .none) return;
-    var pt: POINT = undefined;
-    if (GetCursorPos(&pt) == 0) return;
-    _ = ScreenToClient(ui.popup, &pt);
-    const lp: isize = (@as(isize, pt.y) << 16) | (@as(isize, pt.x) & 0xFFFF);
-    const res: usize = @bitCast(SendMessageW(ui.popup, LB_ITEMFROMPOINT, 0, lp));
-    const idx = res & 0xFFFF;
-    const outside = (res >> 16) & 0xFFFF;
-    const new_hot: usize = if (outside != 0 or idx >= popup_n) std.math.maxInt(usize) else idx;
-    if (new_hot != popup_hot) {
-        popup_hot = new_hot;
-        _ = InvalidateRect(ui.popup, null, 0);
     }
 }
 
 fn requireProc() ?win.Process {
     if (proc) |p| return p;
-    setStatus("Select a process first — click the process name at the top", .{});
+    setStatus("Select a process first — click Select process at the top", .{});
     return null;
 }
 
@@ -1404,19 +1328,18 @@ fn updateResults() void {
 
 fn clearResultsCache() void {
     @memset(res_cache_filled[0..], false);
-    res_cache_top = std.math.maxInt(usize);
 }
 
 /// Sample the values of the rows currently visible in the results list. Called
 /// from timer ticks, never from WM_DRAWITEM, so painting does no memory I/O.
-fn refreshResultsValues() void {
-    const p = proc orelse return;
-    if (busy.load(.acquire)) return;
+fn refreshResultsValues() bool {
+    const p = proc orelse return false;
+    if (busy.load(.acquire)) return false;
     const total = sc.matches.items.len;
-    if (total == 0) return;
+    if (total == 0) return false;
 
     var rc: RECT = undefined;
-    if (GetClientRect(ui.results, &rc) == 0) return;
+    if (GetClientRect(ui.results, &rc) == 0) return false;
     const item_h = @max(1, S(30));
     var visible: usize = @intCast(@divTrunc(@max(rc.bottom - rc.top, item_h), item_h) + 1);
     if (visible > cache_cap) visible = cache_cap;
@@ -1424,43 +1347,83 @@ fn refreshResultsValues() void {
     const top_raw = SendMessageW(ui.results, LB_GETTOPINDEX, 0, 0);
     var top: usize = if (top_raw > 0) @intCast(top_raw) else 0;
     if (top >= total) top = total - 1;
-    res_cache_top = top;
     if (visible > total - top) visible = total - top;
 
     const kind = sc.kind;
     const sz = sc.valueLen();
+    var changed = false;
     var i: usize = 0;
     while (i < visible) : (i += 1) {
         const idx = top + i;
         const slot = idx % cache_cap;
         var cur: [scan.max_value_len]u8 = undefined;
         var vb: [48]u8 = undefined;
-        res_cache_idx[slot] = idx;
         const value_text: []const u8 = if (p.read(sc.matches.items[idx].addr, cur[0..sz])) |_| scan.fmtValueAny(kind, sc.encoding, cur[0..sz], &vb) else |_| "??";
+        if (!res_cache_filled[slot] or res_cache_idx[slot] != idx or res_cache_len[slot] != value_text.len or
+            !std.mem.eql(u8, res_cache_text[slot][0..res_cache_len[slot]], value_text))
+        {
+            changed = true;
+        }
+        res_cache_idx[slot] = idx;
         @memcpy(res_cache_text[slot][0..value_text.len], value_text);
         res_cache_len[slot] = value_text.len;
         res_cache_filled[slot] = true;
     }
+    return changed;
 }
 
-/// Refresh table values in one batch, used by timer ticks and after edits.
-fn refreshTableValues() void {
-    const p = proc orelse return;
-    for (table.items) |*row| {
-        var cur: [8]u8 = undefined;
-        const sz = row.kind.size();
-        if (p.read(row.addr, cur[0..sz])) |_| {
-            const value_text = scan.fmtValue(row.kind, cur[0..sz], &row.shown);
-            row.shown_len = value_text.len;
-            row.shown_ok = true;
-        } else |_| {
-            row.shown_len = 0;
-            row.shown_ok = false;
-        }
+fn sampleTableRow(p: win.Process, row: *Row) bool {
+    var cur: [8]u8 = undefined;
+    const sz = row.kind.size();
+    if (p.read(row.addr, cur[0..sz])) |_| {
+        var vb: [48]u8 = undefined;
+        const value_text = scan.fmtValue(row.kind, cur[0..sz], &vb);
+        const changed = !row.shown_ok or row.shown_len != value_text.len or
+            !std.mem.eql(u8, row.shown[0..row.shown_len], value_text);
+        @memcpy(row.shown[0..value_text.len], value_text);
+        row.shown_len = value_text.len;
+        row.shown_ok = true;
+        return changed;
+    } else |_| {
+        const changed = row.shown_ok;
+        row.shown_len = 0;
+        row.shown_ok = false;
+        return changed;
     }
 }
 
+/// Refresh values for every table row, used after edits and table loads.
+fn refreshTableValues() void {
+    const p = proc orelse return;
+    for (table.items) |*row| _ = sampleTableRow(p, row);
+}
+
+fn refreshVisibleTableValues() bool {
+    const p = proc orelse return false;
+    if (table.items.len == 0) return false;
+
+    var rc: RECT = undefined;
+    if (GetClientRect(ui.table, &rc) == 0) return false;
+    const item_h = @max(1, S(30));
+    const visible: usize = @intCast(@divTrunc(@max(rc.bottom - rc.top, item_h), item_h) + 1);
+
+    const top_raw = SendMessageW(ui.table, LB_GETTOPINDEX, 0, 0);
+    const top: usize = if (top_raw > 0) @intCast(top_raw) else 0;
+    if (top >= table.items.len) return false;
+
+    const end = @min(table.items.len, top + visible);
+    var changed = false;
+    for (table.items[top..end]) |*row| {
+        if (sampleTableRow(p, row)) changed = true;
+    }
+    return changed;
+}
+
 fn attach() void {
+    if (busy.load(.acquire)) {
+        setStatus("Wait for the scan to finish", .{});
+        return;
+    }
     const sel = SendMessageW(ui.procs, LB_GETCURSEL, 0, 0);
     if (sel < 0) {
         setStatus("Select a process from the list", .{});
@@ -1494,7 +1457,7 @@ fn attach() void {
     setStatus("Attached to {s}. Enter a value and press First Scan", .{e.name[0..e.name_len]});
 }
 
-fn scanThread(_: ?*anyopaque) callconv(.winapi) u32 {
+fn scanWorker() void {
     if (job.first) {
         sc.first(gpa, job.p, job.kind, job.cond, job.writable, .{}, job.kind.size(), 0) catch |e| {
             job.err = @errorName(e);
@@ -1504,7 +1467,13 @@ fn scanThread(_: ?*anyopaque) callconv(.winapi) u32 {
     }
     busy.store(false, .release);
     _ = PostMessageW(main_wnd, WM_SCAN_DONE, 0, 0);
-    return 0;
+}
+
+fn joinScan() void {
+    if (scan_thread) |t| {
+        scan_thread = null;
+        t.join();
+    }
 }
 
 fn startJob() void {
@@ -1513,22 +1482,21 @@ fn startJob() void {
     job_start = GetTickCount64();
     scan.cancel_flag.store(false, .release);
     scan.progress.store(0, .release);
-    prog_shown = 0;
     clearResultsCache();
     busy.store(true, .release);
+    syncControls();
     _ = SendMessageW(ui.results, LB_SETCOUNT, 0, 0);
     setStatus("Scanning...", .{});
     show(ui.cancel, true);
     _ = SetTimer(main_wnd, TIMER_PROGRESS, 100, null);
-    const th = CreateThread(null, 0, &scanThread, null, 0, null);
-    if (th) |t| {
-        _ = CloseHandle(t);
-    } else {
+    scan_thread = std.Thread.spawn(.{}, scanWorker, .{}) catch {
         busy.store(false, .release);
         show(ui.cancel, false);
         _ = KillTimer(main_wnd, TIMER_PROGRESS);
+        syncControls();
         setStatus("Failed to start the scan thread", .{});
-    }
+        return;
+    };
 }
 
 fn doScan(first: bool) void {
@@ -1597,14 +1565,15 @@ fn doScan(first: bool) void {
 }
 
 fn onScanDone() void {
-    // Pair with the scan thread's release store before reading its results.
+    joinScan();
+    // Pair with the scan worker's release store before reading its results.
     _ = busy.load(.acquire);
     _ = KillTimer(main_wnd, TIMER_PROGRESS);
     show(ui.cancel, false);
     if (job.err == null and job.first) scan_active = true;
     updateResults();
     if (job.err == null) {
-        refreshResultsValues();
+        _ = refreshResultsValues();
         refreshTableValues();
     }
     const ms = GetTickCount64() - job_start;
@@ -1621,6 +1590,7 @@ fn onScanDone() void {
     } else {
         setStatus("Addresses found: {d} · {d} ms", .{ sc.matches.items.len, ms });
     }
+    syncControls();
 }
 
 fn doReset() void {
@@ -1842,55 +1812,17 @@ fn freezeTick() void {
     }
 }
 
-fn hoverTick() void {
-    const now = GetTickCount64();
-    const elapsed: u64 = if (hover_tick_at == 0) 16 else @min(now - hover_tick_at, 160);
-    hover_tick_at = now;
-    const step: i32 = @intCast(@min(100, elapsed * 100 / 160));
-    popupHoverTick();
-    refreshResultsOnScroll();
-    var pt: POINT = undefined;
-    if (GetCursorPos(&pt) == 0) return;
-    const w = WindowFromPoint(pt);
-    for (anim_btns[0..anim_n], 0..) |bh, i| {
-        const target: i32 = if (w != null and w.? == bh) 100 else 0;
-        const cur = anim_hot[i];
-        if (cur == target) continue;
-        const new_val = if (cur < target) @min(target, cur + step) else @max(target, cur - step);
-        if (new_val != cur) {
-            anim_hot[i] = new_val;
-            _ = InvalidateRect(bh, null, 0);
-        }
-    }
-}
-
-fn refreshResultsOnScroll() void {
-    if (picker or busy.load(.acquire)) return;
-    if (sc.matches.items.len == 0) return;
-    const top_raw = SendMessageW(ui.results, LB_GETTOPINDEX, 0, 0);
-    const top: usize = if (top_raw > 0) @intCast(top_raw) else 0;
-    if (top != res_cache_top) refreshResultsValues();
-}
-
 fn liveTick() void {
     if (proc == null or picker) return;
-    if (table.items.len > 0) {
-        refreshTableValues();
+    if (table.items.len > 0 and refreshVisibleTableValues()) {
         _ = InvalidateRect(ui.table, null, 0);
     }
     if (!busy.load(.acquire) and sc.matches.items.len > 0) {
-        refreshResultsValues();
-        _ = InvalidateRect(ui.results, null, 0);
+        if (refreshResultsValues()) _ = InvalidateRect(ui.results, null, 0);
     }
 }
 
 fn progressTick() void {
-    const target: i32 = @intCast(scan.progress.load(.acquire));
-    const diff = target - prog_shown;
-    if (diff != 0) {
-        const ad = if (diff < 0) -diff else diff;
-        prog_shown += if (ad < 8) diff else @divTrunc(diff, 3);
-    }
     const fr = sbox(b_footer);
     const rc: RECT = .{ .left = fr.x, .top = fr.y, .right = fr.x + fr.w, .bottom = fr.y + fr.h };
     _ = InvalidateRect(main_wnd, &rc, 0);
@@ -1901,7 +1833,9 @@ fn createControls(p: HWND) !void {
     const popup_style = LBS_NOTIFY | LBS_NOINTEGRALHEIGHT | LBS_OWNERDRAWFIXED | LBS_NODATA;
 
     ui.pill = try button(p, L("Select process"), b_pill, ID_PILL);
-    ui.more = try button(p, L("···"), b_more, ID_MORE);
+    ui.save = try button(p, L("Save"), b_save, ID_SAVE);
+    ui.load = try button(p, L("Load"), b_load, ID_LOAD);
+    ui.theme = try button(p, L("Theme"), b_theme, ID_THEME);
 
     ui.filter = try edit(p, b_filter, ID_FILTER, 44);
     ui.procs = try child(p, L("LISTBOX"), L(""), list_style, b_procs, ID_PROCS);
@@ -1944,7 +1878,7 @@ fn onCommand(id: usize, code: usize) void {
             focused_id = 0;
             _ = InvalidateRect(main_wnd, null, 0);
         } else if (code == EN_CHANGE) {
-            if (id == ID_FILTER) refreshProcs();
+            if (id == ID_FILTER) _ = SetTimer(main_wnd, TIMER_FILTER, 180, null);
             if (id == ID_DESC) applyDesc();
         }
         return;
@@ -1986,10 +1920,15 @@ fn onCommand(id: usize, code: usize) void {
     switch (id) {
         ID_PILL => setPicker(!picker),
         ID_PICK_CLOSE => setPicker(false),
+        ID_SAVE => saveTable(),
+        ID_LOAD => loadTable(),
+        ID_THEME => {
+            dark_mode = !dark_mode;
+            applyTheme();
+        },
         ID_PROCS => attach(),
         ID_DD_TYPE => openPopup(.type),
         ID_DD_COND => openPopup(.cond),
-        ID_MORE => openPopup(.menu),
         ID_FIRST => doScan(true),
         ID_NEXT => doScan(false),
         ID_RESET => {
@@ -2016,8 +1955,6 @@ fn wndProc(hwnd: HWND, msg: u32, wp: usize, lp: isize) callconv(.winapi) isize {
             ui_ready = true;
             dark_mode = !systemUsesLightTheme();
             pal = if (dark_mode) dark_pal else light_pal;
-            theme_from = pal;
-            theme_to = pal;
             rebuildBrushes();
             applyThemeChrome();
             refreshProcs();
@@ -2027,8 +1964,13 @@ fn wndProc(hwnd: HWND, msg: u32, wp: usize, lp: isize) callconv(.winapi) isize {
             show(ui.popup, false);
             refreshLabels();
             setStatus("Click Select process at the top to attach to a program", .{});
-            _ = SetTimer(hwnd, TIMER_HOVER, 16, null);
             _ = SetTimer(hwnd, TIMER_LIVE, 500, null);
+            return 0;
+        },
+        WM_CLOSE => {
+            scan.cancel_flag.store(true, .release);
+            joinScan();
+            _ = DestroyWindow(hwnd);
             return 0;
         },
         WM_ERASEBKGND => return 1,
@@ -2087,10 +2029,12 @@ fn wndProc(hwnd: HWND, msg: u32, wp: usize, lp: isize) callconv(.winapi) isize {
         WM_TIMER => {
             switch (wp) {
                 TIMER_FREEZE => freezeTick(),
-                TIMER_HOVER => hoverTick(),
                 TIMER_LIVE => liveTick(),
                 TIMER_PROGRESS => progressTick(),
-                TIMER_ANIM => animTick(),
+                TIMER_FILTER => {
+                    _ = KillTimer(main_wnd, TIMER_FILTER);
+                    refreshProcs();
+                },
                 else => {},
             }
             return 0;
@@ -2100,6 +2044,30 @@ fn wndProc(hwnd: HWND, msg: u32, wp: usize, lp: isize) callconv(.winapi) isize {
             return 0;
         },
         WM_DESTROY => {
+            scan.cancel_flag.store(true, .release);
+            joinScan();
+            _ = KillTimer(hwnd, TIMER_FREEZE);
+            _ = KillTimer(hwnd, TIMER_LIVE);
+            _ = KillTimer(hwnd, TIMER_PROGRESS);
+            _ = KillTimer(hwnd, TIMER_FILTER);
+            if (proc) |p| {
+                p.close();
+                proc = null;
+            }
+            releaseBackBuffer();
+            if (br_bg) |b| _ = DeleteObject(b);
+            if (br_card) |b| _ = DeleteObject(b);
+            if (br_field) |b| _ = DeleteObject(b);
+            br_bg = null;
+            br_card = null;
+            br_field = null;
+            if (ui_ready) {
+                _ = DeleteObject(f_body);
+                _ = DeleteObject(f_semi);
+                _ = DeleteObject(f_title);
+                _ = DeleteObject(f_small);
+                _ = DeleteObject(f_mono);
+            }
             PostQuitMessage(0);
             return 0;
         },

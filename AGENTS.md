@@ -84,9 +84,16 @@ the output is a repeatable MiB/s figure, not a pass/fail check.
 ## GUI rules
 
 - While the scan worker thread runs (`busy`), the UI thread must not touch `sc`,
-  the process handle, or the match list. New heavy commands check `busy` first.
+  the process handle, or the match list. New heavy commands check `busy` first, and
+  `syncControls` keeps the scan buttons disabled.
 - The worker writes its result fields, then clears `busy`, then posts the completion
   message. Keep that order.
+- The worker is joined (`joinScan`) before reading its results, before closing the
+  process, and in `WM_CLOSE`/`WM_DESTROY`. Do not rely on the completion message alone.
+- The main window paints into a persistent back buffer and blits only the dirty
+  rectangle. Release it in `WM_DESTROY`; never keep a bitmap selected in a deleted DC.
+- There are no hover or theme animations and no repaint timer. The process filter is
+  debounced with `TIMER_FILTER`, and list values are refreshed only when they change.
 
 ## Conventions
 
