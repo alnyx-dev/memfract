@@ -5,6 +5,27 @@ and versions follow the `DEPTH.ITERATION` scheme described in `AGENTS.md`.
 
 ## [Unreleased]
 
+## [1.6] — 2026-11-12
+
+### Added
+
+- `scan undo` restores the result set that was active before the last `scan first`,
+  `scan next`, `scan reset`, or `scan snapshot load`. One-shot runs keep that history in
+  `<name>.session.undo`; `serve` keeps it in memory. `scan status` reports `can_undo`, and
+  an undo step is consumed when it is restored.
+- `scan snapshot save|load --file PATH` writes and restores a result set with its type,
+  encoding, truncation flag, and target identity in the `ZSN1` format.
+- `scan next --cond delta --value N` keeps matches whose value changed by exactly N.
+  Float deltas use the same tolerance as `exact`, which `--tol` overrides.
+- The GUI has an Undo button and a Delta condition.
+
+### Changed
+
+- Loading a snapshot while attached to another process fails with `ProcessMismatch`; a
+  snapshot from an earlier instance of the same PID fails with `StaleSnapshot`.
+- `detach` and switching to another PID discard the saved undo history.
+- The session file format is still `ZCS4`; undo and snapshots live in separate files.
+
 ## [1.5] — 2026-11-12
 
 ### Added
