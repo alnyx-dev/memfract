@@ -333,10 +333,50 @@ pub fn decodeText(encoding: Encoding, bytes: []const u8, out: []u8) ?[]const u8 
 pub var progress = std.atomic.Value(u32).init(0);
 pub var cancel_flag = std.atomic.Value(bool).init(false);
 
+pub const max_threads = 64;
+
 pub const Range = struct {
     start: usize = 0,
     end: usize = std.math.maxInt(usize),
 };
+
+pub const Stats = struct {
+    regions_scanned: usize = 0,
+    bytes_read: u64 = 0,
+    threads: usize = 1,
+};
+
+/// A memory source with the two operations scanning needs: a region list and reads.
+/// `win.Process` provides one through `processSource`; tests and the benchmark use
+/// synthetic implementations.
+pub const Source = struct {
+    ctx: *anyopaque,
+    readFn: *const fn (ctx: *anyopaque, addr: usize, dst: []u8) bool,
+    regionsFn: *const fn (ctx: *anyopaque, gpa: std.mem.Allocator, writable_only: bool) anyerror!std.ArrayList(win.Region),
+
+    pub fn read(self: Source, addr: usize, dst: []u8) !void {
+        if (!self.readFn(self.ctx, addr, dst)) return error.ReadFailed;
+    }
+
+    pub fn regions(self: Source, gpa: std.mem.Allocator, writable_only: bool) !std.ArrayList(win.Region) {
+        return self.regionsFn(self.ctx, gpa, writable_only);
+    }
+};
+
+fn processRead(ctx: *anyopaque, addr: usize, dst: []u8) bool {
+    const p: *win.Process = @ptrCast(@alignCast(ctx));
+    p.read(addr, dst) catch return false;
+    return true;
+}
+
+fn processRegions(ctx: *anyopaque, gpa: std.mem.Allocator, writable_only: bool) anyerror!std.ArrayList(win.Region) {
+    const p: *win.Process = @ptrCast(@alignCast(ctx));
+    return p.regions(gpa, writable_only);
+}
+
+pub fn processSource(proc: *win.Process) Source {
+    return .{ .ctx = proc, .readFn = processRead, .regionsFn = processRegions };
+}
 
 const Span = struct { off: usize, len: usize };
 
@@ -359,10 +399,14 @@ pub const Scanner = struct {
     value_len: usize = 0,
     encoding: Encoding = .utf8,
     truncated: bool = false,
+    stats: Stats = .{},
+    budget: ?*std.atomic.Value(usize) = null,
 
     const chunk_size = 1 << 20;
     const page_size = 4096;
     const max_matches = 16_000_000;
+    const next_read_max = 64 * 1024;
+    const next_gap_max = 4096;
 
     pub fn deinit(self: *Scanner, gpa: std.mem.Allocator) void {
         self.matches.deinit(gpa);
@@ -382,6 +426,24 @@ pub const Scanner = struct {
         self.matches.clearRetainingCapacity();
         self.values.clearRetainingCapacity();
         self.truncated = false;
+        self.stats = .{};
+        self.budget = null;
+    }
+
+    fn addMatch(self: *Scanner, gpa: std.mem.Allocator, addr: usize, bytes: []const u8) !bool {
+        if (self.budget) |b| {
+            if (b.fetchAdd(1, .acq_rel) >= max_matches) {
+                _ = b.fetchSub(1, .acq_rel);
+                self.truncated = true;
+                return true;
+            }
+        } else if (self.matches.items.len >= max_matches) {
+            self.truncated = true;
+            return true;
+        }
+        try self.matches.append(gpa, .{ .addr = addr });
+        try self.values.appendSlice(gpa, bytes);
+        return false;
     }
 
     pub fn first(
@@ -393,6 +455,22 @@ pub const Scanner = struct {
         writable_only: bool,
         range: Range,
         alignment: usize,
+        threads: usize,
+    ) !void {
+        var local = proc;
+        return self.firstSource(gpa, processSource(&local), kind, cond, writable_only, range, alignment, threads);
+    }
+
+    pub fn firstSource(
+        self: *Scanner,
+        gpa: std.mem.Allocator,
+        source: Source,
+        kind: Kind,
+        cond: Cond,
+        writable_only: bool,
+        range: Range,
+        alignment: usize,
+        threads: usize,
     ) !void {
         if (kind.isVariable()) {
             if (cond.mode != .exact or cond.pattern_len == 0) return error.MissingPattern;
@@ -402,55 +480,95 @@ pub const Scanner = struct {
         self.encoding = cond.encoding;
         self.value_len = if (kind.isVariable()) cond.pattern_len else kind.size();
         self.reset();
+        errdefer self.reset();
         progress.store(0, .release);
 
         const step = self.valueLen();
         const stride = @max(alignment, 1);
 
-        var regs = try proc.regions(gpa, writable_only);
+        var regs = try source.regions(gpa, writable_only);
         defer regs.deinit(gpa);
 
+        var jobs: std.ArrayList(Job) = .empty;
+        defer jobs.deinit(gpa);
         var total: u64 = 1;
         for (regs.items) |r| {
-            if (regionSpan(range, r.base, r.size, stride, step)) |s| total += s.len;
-        }
-        var done: u64 = 0;
-
-        const buf = try gpa.alloc(u8, chunk_size + step - 1);
-        defer gpa.free(buf);
-
-        outer: for (regs.items) |r| {
             const span = regionSpan(range, r.base, r.size, stride, step) orelse continue;
-            var off = span.off;
-            const stop = span.off + span.len;
-            while (off < stop) : (off += chunk_size) {
-                if (cancel_flag.load(.acquire)) {
-                    self.reset();
-                    return error.Canceled;
-                }
-                const avail = stop - off;
-                // Each chunk owns `starts` start offsets; the read reaches step-1 bytes
-                // further so unaligned values that cross the boundary are still seen.
-                const starts = @min(chunk_size, avail);
-                const n = @min(chunk_size + step - 1, avail);
-                done += starts;
-                progress.store(@intCast(done * 1000 / total), .release);
+            try jobs.append(gpa, .{ .base = r.base, .off = span.off, .len = span.len });
+            total += span.len;
+        }
+        if (jobs.items.len == 0) {
+            progress.store(1000, .release);
+            return;
+        }
 
-                if (proc.read(r.base + off, buf[0..n])) |_| {
-                    if (try self.scanBlock(gpa, kind, cond, buf[0..n], r.base + off, stride, starts)) break :outer;
-                } else |_| {
-                    var po: usize = 0;
-                    while (po < starts) : (po += page_size) {
-                        const pn = @min(page_size, starts - po);
-                        const take = @min(pn + step - 1, avail - po);
-                        if (proc.read(r.base + off + po, buf[po..][0..take])) |_| {
-                            if (try self.scanBlock(gpa, kind, cond, buf[po..][0..take], r.base + off + po, stride, pn)) break :outer;
-                        } else |_| {
-                            proc.read(r.base + off + po, buf[po..][0..pn]) catch continue;
-                            if (try self.scanBlock(gpa, kind, cond, buf[po..][0..pn], r.base + off + po, stride, pn)) break :outer;
-                        }
-                    }
+        const wanted = if (threads == 0) (std.Thread.getCpuCount() catch 1) else threads;
+        const worker_count = @min(@max(wanted, 1), @min(jobs.items.len, max_threads));
+        var budget = std.atomic.Value(usize).init(0);
+        var done = std.atomic.Value(u64).init(0);
+
+        const workers = try gpa.alloc(Worker, worker_count);
+        defer gpa.free(workers);
+        defer for (workers) |*w| w.sc.deinit(gpa);
+
+        const buf_len = chunk_size + step - 1;
+        const bufs = try gpa.alloc(u8, worker_count * buf_len);
+        defer gpa.free(bufs);
+
+        var bounds: [max_threads + 1]usize = undefined;
+        computeBounds(jobs.items, worker_count, &bounds);
+
+        for (workers, 0..) |*w, idx| {
+            w.* = .{
+                .gpa = gpa,
+                .source = source,
+                .kind = kind,
+                .cond = cond,
+                .stride = stride,
+                .step = step,
+                .buf = bufs[idx * buf_len ..][0..buf_len],
+                .jobs = jobs.items[bounds[idx]..bounds[idx + 1]],
+                .done = &done,
+                .total = total,
+            };
+            w.sc.budget = &budget;
+        }
+
+        var spawned: usize = 0;
+        var handles: [max_threads]std.Thread = undefined;
+        while (spawned + 1 < worker_count) : (spawned += 1) {
+            handles[spawned] = std.Thread.spawn(.{}, runWorker, .{&workers[spawned + 1]}) catch break;
+        }
+
+        runWorker(&workers[0]);
+        var g: usize = 1;
+        while (g <= spawned) : (g += 1) handles[g - 1].join();
+        while (g < worker_count) : (g += 1) runWorker(&workers[g]);
+
+        var failed: ?anyerror = null;
+        var canceled = false;
+        for (workers) |*w| {
+            if (w.failed) |e| failed = e;
+            if (w.canceled) canceled = true;
+            if (w.sc.truncated) self.truncated = true;
+            self.stats.regions_scanned += w.sc.stats.regions_scanned;
+            self.stats.bytes_read += w.sc.stats.bytes_read;
+        }
+        self.stats.threads = worker_count;
+
+        if (canceled or failed != null) {
+            self.reset();
+            return failed orelse error.Canceled;
+        }
+
+        for (workers) |*w| {
+            for (w.sc.matches.items, 0..) |m, idx| {
+                if (self.matches.items.len >= max_matches) {
+                    self.truncated = true;
+                    break;
                 }
+                try self.matches.append(gpa, m);
+                try self.values.appendSlice(gpa, w.sc.valueAt(idx));
             }
         }
         progress.store(1000, .release);
@@ -487,17 +605,13 @@ pub const Scanner = struct {
         while (i < starts and i + step <= buf.len) : (i += stride) {
             const cur = buf[i..][0..step];
             if (!check(kind, cur, cur, &cond)) continue;
-            if (self.matches.items.len >= max_matches) {
-                self.truncated = true;
-                return true;
-            }
-            try self.matches.append(gpa, .{ .addr = base + i });
-            try self.values.appendSlice(gpa, cur);
+            if (try self.addMatch(gpa, base + i, cur)) return true;
         }
         return false;
     }
 
-    /// Exact match for integer types with a comptime-known width.
+    /// Exact match for integer types with a comptime-known width. Aligned scans compare
+    /// 16 bytes at a time; unaligned scans (stride != step) take the scalar path.
     fn scanExact(
         self: *Scanner,
         gpa: std.mem.Allocator,
@@ -510,14 +624,29 @@ pub const Scanner = struct {
     ) !bool {
         const step = @sizeOf(T);
         var i: usize = 0;
+
+        if (stride == step) {
+            // Windows x64 is little-endian, so a 16-byte load maps directly onto T lanes.
+            const lanes = 16 / step;
+            const block = lanes * step;
+            const Vec = @Vector(lanes, T);
+            const Mask = @Int(.unsigned, lanes);
+            const needle_vec: Vec = @splat(needle);
+            while (i + block <= starts and i + block <= buf.len) : (i += block) {
+                const bytes = buf[i..][0..block];
+                const vals: Vec = @bitCast(bytes.*);
+                var hits: Mask = @bitCast(vals == needle_vec);
+                while (hits != 0) {
+                    const lane: usize = @intCast(@ctz(hits));
+                    if (try self.addMatch(gpa, base + i + lane * step, bytes[lane * step ..][0..step])) return true;
+                    hits &= hits - 1;
+                }
+            }
+        }
+
         while (i < starts and i + step <= buf.len) : (i += stride) {
             if (std.mem.readInt(T, buf[i..][0..step], .little) != needle) continue;
-            if (self.matches.items.len >= max_matches) {
-                self.truncated = true;
-                return true;
-            }
-            try self.matches.append(gpa, .{ .addr = base + i });
-            try self.values.appendSlice(gpa, buf[i..][0..step]);
+            if (try self.addMatch(gpa, base + i, buf[i..][0..step])) return true;
         }
         return false;
     }
@@ -529,18 +658,24 @@ pub const Scanner = struct {
     }
 
     pub fn next(self: *Scanner, proc: win.Process, cond: Cond) bool {
+        var local = proc;
+        return self.nextSource(processSource(&local), cond);
+    }
+
+    pub fn nextSource(self: *Scanner, source: Source, cond: Cond) bool {
         const step = self.valueLen();
         const total = self.matches.items.len;
         var w: usize = 0;
         var i: usize = 0;
         var canceled = false;
-        var page: [page_size]u8 = undefined;
+        var window: [next_read_max + page_size]u8 = undefined;
         var cur: [max_value_len]u8 = undefined;
         var next_check: usize = 0;
+        self.stats = .{};
         progress.store(0, .release);
 
-        // Matches are stored in ascending address order, so every 4 KB page can be
-        // read once and reused for all matches that fall inside it.
+        // Matches are stored in ascending address order, so nearby matches share one
+        // read. Gaps up to next_gap_max are bridged; each window is capped at 64 KB.
         while (i < total) {
             if (i >= next_check) {
                 next_check = i + 1024;
@@ -555,41 +690,47 @@ pub const Scanner = struct {
                 }
             }
 
-            const base = self.matches.items[i].addr & ~@as(usize, page_size - 1);
-            const limit = page_size - step;
-            var j = i;
+            const first_addr = self.matches.items[i].addr;
+            const base = first_addr & ~@as(usize, page_size - 1);
+            var end = first_addr + step;
+            var j = i + 1;
             while (j < total) {
                 const a = self.matches.items[j].addr;
-                if (a < base or a - base > limit) break;
+                const prev_end = self.matches.items[j - 1].addr + step;
+                if (a >= prev_end and a - prev_end > next_gap_max) break;
+                if (a + step - base > next_read_max + page_size) break;
+                if (a + step > end) end = a + step;
                 j += 1;
             }
 
-            if (j == i) {
-                // The value straddles a page boundary (not produced by aligned scans).
-                const m = self.matches.items[i];
-                i += 1;
-                if (proc.read(m.addr, cur[0..step])) {
-                    if (check(self.kind, cur[0..step], self.valueAt(i - 1), &cond)) {
-                        self.matches.items[w] = m;
-                        @memcpy(self.values.items[w * step ..][0..step], cur[0..step]);
-                        w += 1;
-                    }
-                } else |_| {}
-                continue;
-            }
-
-            if (proc.read(base, page[0..])) |_| {
+            const len = end - base;
+            self.stats.regions_scanned += 1;
+            if (source.read(base, window[0..len])) |_| {
+                self.stats.bytes_read += len;
                 var k = i;
                 while (k < j) : (k += 1) {
                     const m = self.matches.items[k];
                     const off = m.addr - base;
-                    if (check(self.kind, page[off..][0..step], self.valueAt(k), &cond)) {
+                    if (check(self.kind, window[off..][0..step], self.valueAt(k), &cond)) {
                         self.matches.items[w] = m;
-                        @memcpy(self.values.items[w * step ..][0..step], page[off..][0..step]);
+                        std.mem.copyForwards(u8, self.values.items[w * step ..][0..step], window[off..][0..step]);
                         w += 1;
                     }
                 }
-            } else |_| {}
+            } else |_| {
+                var k = i;
+                while (k < j) : (k += 1) {
+                    const m = self.matches.items[k];
+                    if (source.read(m.addr, cur[0..step])) |_| {
+                        self.stats.bytes_read += step;
+                        if (check(self.kind, cur[0..step], self.valueAt(k), &cond)) {
+                            self.matches.items[w] = m;
+                            std.mem.copyForwards(u8, self.values.items[w * step ..][0..step], cur[0..step]);
+                            w += 1;
+                        }
+                    } else |_| {}
+                }
+            }
             i = j;
         }
         self.matches.shrinkRetainingCapacity(w);
@@ -598,6 +739,111 @@ pub const Scanner = struct {
         return canceled;
     }
 };
+
+const Job = struct { base: usize, off: usize, len: usize };
+
+const Worker = struct {
+    gpa: std.mem.Allocator,
+    source: Source,
+    kind: Kind,
+    cond: Cond,
+    stride: usize,
+    step: usize,
+    buf: []u8,
+    jobs: []const Job,
+    done: *std.atomic.Value(u64),
+    total: u64,
+    sc: Scanner = .{},
+    canceled: bool = false,
+    failed: ?anyerror = null,
+};
+
+fn runWorker(w: *Worker) void {
+    w.sc.kind = w.kind;
+    w.sc.encoding = w.cond.encoding;
+    w.sc.value_len = w.step;
+
+    for (w.jobs) |job| {
+        w.sc.stats.regions_scanned += 1;
+        var off = job.off;
+        const stop = job.off + job.len;
+        while (off < stop) : (off += Scanner.chunk_size) {
+            if (cancel_flag.load(.acquire)) {
+                w.canceled = true;
+                return;
+            }
+            if (w.sc.budget) |b| {
+                if (b.load(.acquire) > Scanner.max_matches) {
+                    w.sc.truncated = true;
+                    return;
+                }
+            }
+            const avail = stop - off;
+            // Each chunk owns `starts` start offsets; the read reaches step-1 bytes
+            // further so unaligned values that cross the boundary are still seen.
+            const starts = @min(Scanner.chunk_size, avail);
+            const n = @min(Scanner.chunk_size + w.step - 1, avail);
+            _ = w.done.fetchAdd(starts, .monotonic);
+            progress.store(@intCast(w.done.load(.monotonic) * 1000 / w.total), .release);
+
+            if (w.source.read(job.base + off, w.buf[0..n])) |_| {
+                w.sc.stats.bytes_read += n;
+                const full = w.sc.scanBlock(w.gpa, w.kind, w.cond, w.buf[0..n], job.base + off, w.stride, starts) catch |e| {
+                    w.failed = e;
+                    return;
+                };
+                if (full) return;
+            } else |_| {
+                var po: usize = 0;
+                while (po < starts) : (po += Scanner.page_size) {
+                    const pn = @min(Scanner.page_size, starts - po);
+                    const take = @min(pn + w.step - 1, avail - po);
+                    if (w.source.read(job.base + off + po, w.buf[po..][0..take])) |_| {
+                        w.sc.stats.bytes_read += take;
+                        const full = w.sc.scanBlock(w.gpa, w.kind, w.cond, w.buf[po..][0..take], job.base + off + po, w.stride, pn) catch |e| {
+                            w.failed = e;
+                            return;
+                        };
+                        if (full) return;
+                    } else |_| {
+                        if (w.source.read(job.base + off + po, w.buf[po..][0..pn])) |_| {
+                            w.sc.stats.bytes_read += pn;
+                            const full = w.sc.scanBlock(w.gpa, w.kind, w.cond, w.buf[po..][0..pn], job.base + off + po, w.stride, pn) catch |e| {
+                                w.failed = e;
+                                return;
+                            };
+                            if (full) return;
+                        } else |_| {}
+                    }
+                }
+            }
+        }
+    }
+}
+
+/// Split jobs into contiguous groups of roughly equal byte counts. Every group gets
+/// at least one job, so merging the groups in order keeps matches address-sorted.
+fn computeBounds(jobs: []const Job, workers: usize, bounds: *[max_threads + 1]usize) void {
+    var total: u64 = 0;
+    for (jobs) |job| total += job.len;
+    bounds[0] = 0;
+    bounds[workers] = jobs.len;
+
+    var ji: usize = 0;
+    var g: usize = 1;
+    while (g < workers) : (g += 1) {
+        var acc: u64 = 0;
+        var k: usize = 0;
+        while (k < ji) : (k += 1) acc += jobs[k].len;
+
+        const target = total * g / workers;
+        while (ji < jobs.len and acc < target) : (ji += 1) acc += jobs[ji].len;
+
+        const limit = jobs.len - (workers - g);
+        if (ji > limit) ji = limit;
+        bounds[g] = ji;
+    }
+}
 
 test "encode roundtrip" {
     const v = try encode(.int32, "1337");
@@ -880,4 +1126,127 @@ test "fmtValueAny formats strings and bytes" {
     try std.testing.expectEqualStrings("hi", fmtValueAny(.string, .utf8, "hi", &buf));
     try std.testing.expectEqualStrings("hi", fmtValueAny(.string, .utf16le, "h\x00i\x00", &buf));
     try std.testing.expectEqualStrings("488b9000", fmtValueAny(.bytes, .utf8, "\x48\x8b\x90\x00", &buf));
+}
+
+const TestMem = struct {
+    bases: [4]usize = .{ 0x10_0000, 0x20_0000, 0x30_0000, 0x40_0000 },
+    mem: [4][]u8,
+    reads: usize = 0,
+
+    fn readFn(ctx: *anyopaque, addr: usize, dst: []u8) bool {
+        const self: *TestMem = @ptrCast(@alignCast(ctx));
+        self.reads += 1;
+        for (self.mem, 0..) |m, i| {
+            const base = self.bases[i];
+            if (addr >= base and addr - base <= m.len and dst.len <= m.len - (addr - base)) {
+                @memcpy(dst, m[addr - base ..][0..dst.len]);
+                return true;
+            }
+        }
+        return false;
+    }
+
+    fn regionsFn(ctx: *anyopaque, gpa: std.mem.Allocator, writable_only: bool) anyerror!std.ArrayList(win.Region) {
+        _ = writable_only;
+        const self: *TestMem = @ptrCast(@alignCast(ctx));
+        var list: std.ArrayList(win.Region) = .empty;
+        for (self.mem, 0..) |m, i| {
+            try list.append(gpa, .{ .base = self.bases[i], .size = m.len, .protect = 0x04, .mem_type = 0x20000 });
+        }
+        return list;
+    }
+
+    fn source(self: *TestMem) Source {
+        return .{ .ctx = self, .readFn = readFn, .regionsFn = regionsFn };
+    }
+};
+
+test "vectorized exact scan covers full blocks and the scalar tail" {
+    const a = std.testing.allocator;
+    var sc: Scanner = .{};
+    defer sc.deinit(a);
+
+    const cond: Cond = .{ .mode = .exact, .a = try encode(.uint32, "0xAABBCCDD") };
+    var buf = std.mem.zeroes([68]u8);
+    const positions = [_]usize{ 0, 16, 28, 44, 64 };
+    for (positions) |p| std.mem.writeInt(u32, buf[p..][0..4], 0xAABBCCDD, .little);
+
+    _ = try sc.scanBlock(a, .uint32, cond, &buf, 0x1000, 4, buf.len);
+    try std.testing.expectEqual(positions.len, sc.matches.items.len);
+    for (positions, 0..) |p, i| {
+        try std.testing.expectEqual(0x1000 + p, sc.matches.items[i].addr);
+    }
+}
+
+test "firstSource scans regions on several threads and merges in address order" {
+    const a = std.testing.allocator;
+    const zone = 8192;
+    var mem: TestMem = .{ .mem = undefined };
+    for (0..mem.mem.len) |i| mem.mem[i] = try a.alloc(u8, zone);
+    defer for (mem.mem) |m| a.free(m);
+    for (mem.mem) |m| @memset(m, 0);
+
+    const needle: u32 = 0x0BADC0DE;
+    const offsets = [_]usize{ 0, 16, 4096, zone - 4 };
+    for (mem.mem) |m| {
+        for (offsets) |off| std.mem.writeInt(u32, m[off..][0..4], needle, .little);
+    }
+
+    const cond: Cond = .{ .mode = .exact, .a = try encode(.uint32, "0x0BADC0DE") };
+    var threaded: Scanner = .{};
+    defer threaded.deinit(a);
+    try threaded.firstSource(a, mem.source(), .uint32, cond, true, .{}, 4, 4);
+
+    const expected = mem.mem.len * offsets.len;
+    try std.testing.expectEqual(expected, threaded.matches.items.len);
+    try std.testing.expectEqual(@as(usize, 4), threaded.stats.threads);
+    try std.testing.expectEqual(mem.mem.len, threaded.stats.regions_scanned);
+    try std.testing.expect(threaded.stats.bytes_read >= expected * 4);
+    for (threaded.matches.items, 0..) |m, i| {
+        if (i > 0) try std.testing.expect(m.addr > threaded.matches.items[i - 1].addr);
+        try std.testing.expectEqual(needle, std.mem.readInt(u32, threaded.valueAt(i)[0..4], .little));
+    }
+
+    var single: Scanner = .{};
+    defer single.deinit(a);
+    try single.firstSource(a, mem.source(), .uint32, cond, true, .{}, 4, 1);
+    try std.testing.expectEqual(@as(usize, 1), single.stats.threads);
+    try std.testing.expectEqual(expected, single.matches.items.len);
+    for (single.matches.items, 0..) |m, i| {
+        try std.testing.expectEqual(threaded.matches.items[i].addr, m.addr);
+    }
+}
+
+test "nextSource filters changed values and coalesces reads" {
+    const a = std.testing.allocator;
+    const zone = 8192;
+    var mem: TestMem = .{ .mem = undefined };
+    for (0..mem.mem.len) |i| mem.mem[i] = try a.alloc(u8, zone);
+    defer for (mem.mem) |m| a.free(m);
+    for (mem.mem) |m| @memset(m, 0);
+
+    var off: usize = 0;
+    while (off + 4 <= zone) : (off += 16) {
+        std.mem.writeInt(u32, mem.mem[0][off..][0..4], 77, .little);
+    }
+
+    const cond: Cond = .{ .mode = .exact, .a = try encode(.uint32, "77") };
+    var sc: Scanner = .{};
+    defer sc.deinit(a);
+    try sc.firstSource(a, mem.source(), .uint32, cond, true, .{ .start = mem.bases[0], .end = mem.bases[0] + zone }, 4, 1);
+    try std.testing.expectEqual(zone / 16, sc.matches.items.len);
+
+    std.mem.writeInt(u32, mem.mem[0][0..4], 99, .little);
+    std.mem.writeInt(u32, mem.mem[0][zone - 16 ..][0..4], 99, .little);
+
+    mem.reads = 0;
+    const canceled = sc.nextSource(mem.source(), .{ .mode = .changed });
+    try std.testing.expect(!canceled);
+    try std.testing.expectEqual(@as(usize, 1), mem.reads);
+    try std.testing.expectEqual(@as(usize, 2), sc.matches.items.len);
+    try std.testing.expectEqual(mem.bases[0], sc.matches.items[0].addr);
+    try std.testing.expectEqual(mem.bases[0] + zone - 16, sc.matches.items[1].addr);
+    try std.testing.expectEqual(@as(usize, 1), sc.stats.regions_scanned);
+    try std.testing.expect(sc.stats.bytes_read <= zone);
+    try std.testing.expectEqual(@as(u32, 99), std.mem.readInt(u32, sc.valueAt(0)[0..4], .little));
 }

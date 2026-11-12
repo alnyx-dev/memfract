@@ -1496,7 +1496,7 @@ fn attach() void {
 
 fn scanThread(_: ?*anyopaque) callconv(.winapi) u32 {
     if (job.first) {
-        sc.first(gpa, job.p, job.kind, job.cond, job.writable, .{}, job.kind.size()) catch |e| {
+        sc.first(gpa, job.p, job.kind, job.cond, job.writable, .{}, job.kind.size(), 0) catch |e| {
             job.err = @errorName(e);
         };
     } else {

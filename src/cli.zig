@@ -53,7 +53,7 @@ const value_opts = [_][]const u8{
     "--pid",       "--process", "--type",   "--cond",    "--value",   "--value2",   "--addr",
     "--size",      "--limit",   "--offset", "--session", "--filter",  "--for",      "--interval",
     "--count",     "--desc",    "--index",  "--file",    "--timeout", "--offsets",  "--tol",
-    "--from-scan", "--module",  "--start",  "--end",     "--align",   "--encoding",
+    "--from-scan", "--module",  "--start",  "--end",     "--align",   "--encoding", "--threads",
 };
 
 fn takesValue(t: []const u8) bool {
@@ -493,6 +493,14 @@ fn alignmentArg(args: Args, kind: scan.Kind) !usize {
     return @intCast(n);
 }
 
+fn threadsArg(args: Args) !usize {
+    const t = args.opt("--threads") orelse return 0;
+    const n = try parseU64(t);
+    if (n == 0 or n > scan.max_threads)
+        return fail(error.BadArgs, "--threads must be between 1 and {d}", .{scan.max_threads});
+    return @intCast(n);
+}
+
 fn scanRange(a: std.mem.Allocator, s: *Session, args: Args) !scan.Range {
     var range: scan.Range = .{};
     if (args.opt("--start")) |t| range.start = try parseAddrText(a, s, t);
@@ -710,7 +718,7 @@ const help_entries = [_]HelpEntry{
     .{ .name = "detach", .usage = "detach", .desc = "Forget the selected process and clear scan results." },
     .{ .name = "read", .usage = "read --addr A [--offsets o1,o2] (--type T | --size N)", .desc = "Read a typed value or a hex dump. A is 0x... or module+offset. --offsets follows a pointer chain." },
     .{ .name = "write", .usage = "write --addr A --value V [--type T] [--offsets o1,o2]", .desc = "Write a value and read it back." },
-    .{ .name = "scan first", .usage = "scan first [--type T] [--cond C] [--value V] [--value2 V] [--encoding E] [--module NAME] [--start A] [--end A] [--align N] [--all] [--tol X] [--timeout MS]", .desc = "First scan. Conds: exact, greater, less, between, unknown. Scans writable memory unless --all; --module/--start/--end limit the address range. --align N (a power of two, default the type size) sets the address alignment; use --align 1 for unaligned values. string and bytes scans need --cond exact with --value as the pattern." },
+    .{ .name = "scan first", .usage = "scan first [--type T] [--cond C] [--value V] [--value2 V] [--encoding E] [--module NAME] [--start A] [--end A] [--align N] [--threads N] [--all] [--tol X] [--timeout MS]", .desc = "First scan. Conds: exact, greater, less, between, unknown. Scans writable memory unless --all; --module/--start/--end limit the address range. --align N (a power of two, default the type size) sets the address alignment; use --align 1 for unaligned values. --threads N sets the worker count (default: CPU count). string and bytes scans need --cond exact with --value as the pattern." },
     .{ .name = "scan next", .usage = "scan next --cond C [--value V] [--value2 V] [--encoding E] [--tol X] [--timeout MS]", .desc = "Filter previous results. Conds: exact, greater, less, between, changed, unchanged, increased, decreased. For string and bytes only exact, changed and unchanged are supported." },
     .{ .name = "scan list", .usage = "scan list [--offset N] [--limit N]", .desc = "Show results with current and previous values (limit <= 10000, default 50). String values are JSON strings; bytes values are hex strings." },
     .{ .name = "scan status", .usage = "scan status", .desc = "Scan state: count, type, truncated flag." },
@@ -736,6 +744,7 @@ const help_notes = [_][]const u8{
     "String scans match the bytes of --value, encoded as --encoding utf8 (default) or utf16le. Bytes scans take a hex pattern such as \"48 8B ?? ?? 89\", where ?? matches any byte. Patterns are limited to 256 bytes and scanned on every byte offset.",
     "One-shot mode keeps scan state in %TEMP%\\memfract\\<session>.session (--session NAME, default 'default'; --no-session disables). Use 'serve' for many commands without disk I/O.",
     "Typical flow: ps -> attach -> scan first -> (change value in target) -> scan next -> scan list -> table add -> write/freeze.",
+    "First scans read memory on all CPU cores and use vectorized exact matching for integer types; --threads N overrides the worker count. Scan responses include regions_scanned (regions for scan first, read windows for scan next), bytes_read (bytes actually read) and elapsed_ms. A failed block read falls back to 4 KB pages.",
     "Run as Administrator to open most processes. Not for use against online games or protected processes.",
     "Session files are written atomically. If a saved session is corrupt it is moved to <name>.session.corrupt, a fresh session is started, and the response includes a 'notice' field.",
     "Long-running commands (scan, freeze, watch) stop on Ctrl+C and return a normal JSON response; freeze and watch also accept --timeout MS as an upper bound.",
@@ -886,6 +895,8 @@ fn scanSummary(s: *Session, w: *json.Writer, elapsed_ms: u64) !void {
     try w.kvStr("type", @tagName(s.sc.kind));
     try w.kvInt("count", s.sc.matches.items.len);
     try w.kvBool("truncated", s.sc.truncated);
+    try w.kvInt("regions_scanned", s.sc.stats.regions_scanned);
+    try w.kvInt("bytes_read", s.sc.stats.bytes_read);
     try w.kvInt("elapsed_ms", elapsed_ms);
 }
 
@@ -904,10 +915,11 @@ fn cmdScan(a: std.mem.Allocator, s: *Session, args: Args, w: *json.Writer) !void
         const range = try scanRange(a, s, args);
         const alignment = try alignmentArg(args, kind);
         const timeout = try timeoutArg(args);
+        const threads = try threadsArg(args);
 
         startWatchdog(timeout);
         const t0 = GetTickCount64();
-        const res = s.sc.first(gpa, p, kind, cond, !args.flag("--all"), range, alignment);
+        const res = s.sc.first(gpa, p, kind, cond, !args.flag("--all"), range, alignment, threads);
         stopWatchdog();
         res catch |e| {
             if (e == error.Canceled) {

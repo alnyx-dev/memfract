@@ -70,6 +70,8 @@ extern "kernel32" fn Module32NextW(snap: HANDLE, e: *MODULEENTRY32W) callconv(.w
 extern "kernel32" fn GetStdHandle(which: u32) callconv(.winapi) ?HANDLE;
 extern "kernel32" fn ReadFile(h: HANDLE, buf: [*]u8, n: u32, read: *u32, overlapped: ?*anyopaque) callconv(.winapi) i32;
 extern "kernel32" fn GetProcessTimes(h: HANDLE, creation: *FILETIME, exit: *FILETIME, kernel: *FILETIME, user: *FILETIME) callconv(.winapi) i32;
+extern "kernel32" fn QueryPerformanceCounter(out: *i64) callconv(.winapi) i32;
+extern "kernel32" fn QueryPerformanceFrequency(out: *i64) callconv(.winapi) i32;
 extern "kernel32" fn GetCommandLineW() callconv(.winapi) [*:0]const u16;
 extern "shell32" fn CommandLineToArgvW(cmd: [*:0]const u16, argc: *i32) callconv(.winapi) ?[*][*:0]u16;
 extern "kernel32" fn LocalFree(h: usize) callconv(.winapi) usize;
@@ -160,6 +162,20 @@ pub const Process = struct {
         return list;
     }
 };
+
+/// Monotonic counter for measuring short intervals: pair with `perfFrequency`.
+pub fn perfCounter() i64 {
+    var v: i64 = 0;
+    _ = QueryPerformanceCounter(&v);
+    return v;
+}
+
+pub fn perfFrequency() i64 {
+    var v: i64 = 0;
+    _ = QueryPerformanceFrequency(&v);
+    if (v == 0) return 1;
+    return v;
+}
 
 pub fn listProcesses(filter: []const u8) void {
     const snap = CreateToolhelp32Snapshot(TH32CS_SNAPPROCESS, 0);

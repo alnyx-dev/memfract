@@ -44,6 +44,14 @@ try {
 
     $scan = Invoke-Cli scan first --type int32 --value 305419896 --session $session
     if ($scan.count -lt 1) { throw "first scan found nothing" }
+    if ($scan.regions_scanned -lt 1 -or $scan.bytes_read -lt 1) {
+        throw "scan response is missing regions_scanned or bytes_read: $($scan | ConvertTo-Json -Compress)"
+    }
+
+    $scan1 = Invoke-Cli scan first --type int32 --value 305419896 --threads 1 --session $session
+    if ($scan1.count -ne $scan.count) {
+        throw "single-threaded scan found $($scan1.count) addresses, multi-threaded found $($scan.count)"
+    }
 
     $list = Invoke-Cli scan list --session $session
     $addr = $list.results[0].address

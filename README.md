@@ -13,6 +13,7 @@ A Windows x64 memory scanner written in Zig: a JSON CLI for automation and a Flu
 - Scan for `string` values (UTF-8 or UTF-16LE via `--encoding`) and for `bytes` patterns with wildcards such as `48 8B ?? ?? 89`.
 - Integer values accept decimal, hex (`0x..`), octal, and binary literals.
 - Limit a first scan to a module or an address range (`--module`, `--start`, `--end`) and choose the address alignment (`--align`, use `1` for unaligned values).
+- First scans run on all CPU cores (`--threads N` to override) and compare integer `exact` values with SIMD; responses report `regions_scanned`, `bytes_read`, and `elapsed_ms`.
 - Conditions: exact, greater/less, between, changed/unchanged, increased/decreased, unknown initial value. `string` and `bytes` scans support exact, changed, and unchanged.
 - Pointer chains (`module+offset`, `--offsets`) and stable addresses.
 - Address table with descriptions, save/load in a GUI-compatible text format.
@@ -59,6 +60,7 @@ Useful build steps:
 | `zig build --release=safe` | release build (ReleaseSafe) |
 | `zig build test` | unit tests (`scan`, `json`, `cli`, `util`) |
 | `zig build smoke` | integration test: attach, scan, write, table, detach |
+| `zig build bench` | benchmark scans over synthetic regions (ReleaseFast) |
 | `zig build target` | build `target.exe`, a demo target for experiments |
 | `zig build run -- version` | run the CLI with arguments |
 | `zig build run-gui` | run the GUI |
@@ -115,6 +117,7 @@ src/
   cli.zig       JSON CLI (primary automation interface)
   gui.zig       Win32/GDI+ GUI
   scan.zig      scanning and value comparison engine
+  bench.zig     benchmark over synthetic memory regions
   util.zig      shared helpers (number parsing, UTF-8, table file format)
   json.zig      minimal JSON writer
   win.zig       WinAPI wrappers (processes, memory, modules, files)

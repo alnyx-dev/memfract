@@ -14,6 +14,7 @@ zig build              # installs memfract.exe and memfract-gui.exe into zig-out
 zig build test         # unit tests (src/tests.zig imports the module tests)
 zig build smoke        # Windows integration test: tests/smoke.ps1 drives memfract.exe
                        # against tests/fixture.zig (needs PowerShell)
+zig build bench        # benchmark over synthetic regions (ReleaseFast)
 zig build target       # demo process target.exe (prints its PID and the address of hp)
 zig build repl         # legacy interactive REPL, memfract-repl.exe
 zig build run -- ps    # run the CLI with arguments
@@ -21,7 +22,8 @@ zig build run-gui      # run the GUI
 ```
 
 Run `zig build test` before every commit, and `zig build smoke` after touching `cli.zig`,
-`scan.zig` or `win.zig`.
+`scan.zig` or `win.zig`. Run `zig build bench` before and after scan-performance changes;
+the output is a repeatable MiB/s figure, not a pass/fail check.
 
 ## Layout
 
@@ -29,6 +31,7 @@ Run `zig build test` before every commit, and `zig build smoke` after touching `
 |------|------|
 | `src/win.zig` | Thin Win32 wrapper: `Process` (open/read/write/regions/modules), process listing, console and file I/O, atomic file write. All `extern` declarations live here. |
 | `src/scan.zig` | `Scanner`: `first` / `next`, `Kind` (int32 int64 float32 float64), `Cond`, value encode/format/compare. No I/O, no UI. |
+| `src/bench.zig` | Benchmark over synthetic memory regions (`zig build bench`). |
 | `src/cli.zig` | One-shot commands and `serve` mode. Command table (`HelpEntry`), arg parsing, JSON responses, session save/load. |
 | `src/gui.zig` | Win32 GUI. Scans run on a worker thread. |
 | `src/util.zig` | Number normalization, float tolerance, UTF-8 clipping, address-table line format. |
@@ -65,6 +68,13 @@ Run `zig build test` before every commit, and `zig build smoke` after touching `
   `max_matches` is 16,000,000 and sets `truncated` instead of failing.
 - `first` fills a result, `next` only filters it. A read failure in `next` drops that
   match instead of aborting.
+- `first` splits the scanned regions into contiguous worker groups and merges them in
+  address order, so `matches` stays sorted no matter how many threads run. Workers share
+  one `max_matches` budget; the `truncated` flag is set when it runs out.
+- `next` reads nearby matches in shared windows of up to 64 KB, bridging gaps of 4 KB or
+  less, and falls back to per-match reads when a window read fails.
+- `stats` (`regions_scanned`, `bytes_read`, `threads`) is runtime-only and not stored in
+  session files.
 - Long operations must honor `cancel_flag` (Ctrl+C, `--timeout` watchdog, GUI cancel)
   and report `canceled` rather than an error.
 - Writable-only region listing excludes `MEM_MAPPED`; `--all` includes it.

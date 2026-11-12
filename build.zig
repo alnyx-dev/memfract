@@ -55,6 +55,19 @@ pub fn build(b: *std.Build) void {
     const smoke_step = b.step("smoke", "Run Windows integration smoke tests");
     smoke_step.dependOn(&smoke_cmd.step);
 
+    const bench = b.addExecutable(.{
+        .name = "memfract-bench",
+        .root_module = b.createModule(.{
+            .root_source_file = b.path("src/bench.zig"),
+            .target = target,
+            .optimize = .ReleaseFast,
+        }),
+    });
+    const run_bench = b.addRunArtifact(bench);
+    run_bench.addPassthruArgs();
+    const bench_step = b.step("bench", "Benchmark scanning over synthetic memory (ReleaseFast)");
+    bench_step.dependOn(&run_bench.step);
+
     const run_cli = b.addRunArtifact(cli);
     run_cli.addPassthruArgs();
     const run_step = b.step("run", "Run the JSON CLI");
