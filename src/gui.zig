@@ -602,16 +602,9 @@ fn text(hdc: HDC, font: *anyopaque, rgb: u32, s: []const u8, x: i32, y: i32, w: 
     _ = DrawTextW(hdc, z.ptr, @intCast(z.len), &rc, flags);
 }
 
-fn rrect(hdc: HDC, x: i32, y: i32, w: i32, h: i32, r: i32, fill: ?u32, border: ?u32) void {
-    if (w < 3 or h < 3) return;
-    var g: ?*anyopaque = null;
-    if (GdipCreateFromHDC(hdc, &g) != 0) return;
-    defer _ = GdipDeleteGraphics(g);
-    _ = GdipSetSmoothingMode(g, 4);
-
+fn roundPath(x: i32, y: i32, w: i32, h: i32, r: i32) ?*anyopaque {
     var path: ?*anyopaque = null;
-    if (GdipCreatePath(0, &path) != 0) return;
-    defer _ = GdipDeletePath(path);
+    if (GdipCreatePath(0, &path) != 0) return null;
 
     const ww = w - 1;
     const hh = h - 1;
@@ -626,8 +619,23 @@ fn rrect(hdc: HDC, x: i32, y: i32, w: i32, h: i32, r: i32, fill: ?u32, border: ?
         _ = GdipAddPathArcI(path, x, y + hh - d, d, d, 90, 90);
         _ = GdipClosePathFigure(path);
     }
+    return path;
+}
+
+fn rrect(hdc: HDC, x: i32, y: i32, w: i32, h: i32, r: i32, fill: ?u32, border: ?u32) void {
+    rrectWidth(hdc, x, y, w, h, r, fill, border, 1.0);
+}
+
+fn rrectWidth(hdc: HDC, x: i32, y: i32, w: i32, h: i32, r: i32, fill: ?u32, border: ?u32, width: f32) void {
+    if (w < 3 or h < 3) return;
+    var g: ?*anyopaque = null;
+    if (GdipCreateFromHDC(hdc, &g) != 0) return;
+    defer _ = GdipDeleteGraphics(g);
+    _ = GdipSetSmoothingMode(g, 4);
 
     if (fill) |f| {
+        const path = roundPath(x, y, w, h, r) orelse return;
+        defer _ = GdipDeletePath(path);
         var b: ?*anyopaque = null;
         if (GdipCreateSolidFill(argb(f), &b) == 0) {
             _ = GdipFillPath(g, b, path);
@@ -635,8 +643,11 @@ fn rrect(hdc: HDC, x: i32, y: i32, w: i32, h: i32, r: i32, fill: ?u32, border: ?
         }
     }
     if (border) |bc| {
+        const inset: i32 = if (width <= 1.0) 0 else @intFromFloat(@round(width / 2.0));
+        const path = roundPath(x + inset, y + inset, w - inset * 2, h - inset * 2, @max(1, r - inset)) orelse return;
+        defer _ = GdipDeletePath(path);
         var pen: ?*anyopaque = null;
-        if (GdipCreatePen1(argb(bc), 1.0, 2, &pen) == 0) {
+        if (GdipCreatePen1(argb(bc), width, 2, &pen) == 0) {
             _ = GdipDrawPath(g, pen, path);
             _ = GdipDeletePen(pen);
         }
@@ -775,7 +786,8 @@ fn paintMain(hwnd: HWND) void {
     }
 
     if (popup_kind != .none) {
-        rrect(mdc, popup_rc.x - 1, popup_rc.y - 1, popup_rc.w + 2, popup_rc.h + 2, S(8), null, pal.card_border);
+        const pb = S(2);
+        rrectWidth(mdc, popup_rc.x - pb, popup_rc.y - pb, popup_rc.w + pb * 2, popup_rc.h + pb * 2, S(8), null, pal.card_border, @floatFromInt(pb));
     }
 
     const fy = S(b_footer.y);
@@ -900,15 +912,18 @@ fn drawButtonContent(di: *const DRAWITEMSTRUCT) void {
         fill = mix(fill, pal.bg, 35);
     }
 
-    rrect(hdc, rc.left, rc.top, w, h, radius, fill, border);
+    const expanded = st == .dropdown and ((id == ID_DD_TYPE and popup_kind == .type) or (id == ID_DD_COND and popup_kind == .cond));
+    if (st == .dropdown) {
+        rrectWidth(hdc, rc.left, rc.top, w, h, radius, fill, if (expanded) pal.accent else pal.btn_border, @floatFromInt(S(2)));
+    } else {
+        rrect(hdc, rc.left, rc.top, w, h, radius, fill, border);
+    }
 
     if (st == .pill) {
         const dot = if (proc != null) pal.good else pal.text2;
         rrect(hdc, rc.left + S(16), rc.top + @divTrunc(h - S(8), 2), S(8), S(8), S(4), dot, null);
         text(hdc, f_semi, fg, label_s, rc.left + S(32), rc.top, w - S(44), h, DT_V);
     } else if (st == .dropdown) {
-        const expanded = (id == ID_DD_TYPE and popup_kind == .type) or (id == ID_DD_COND and popup_kind == .cond);
-        if (expanded) rrect(hdc, rc.left, rc.top, w, h, radius, null, pal.accent);
         text(hdc, f_body, fg, label_s, rc.left + S(14), rc.top, w - S(48), h, DT_V);
         text(hdc, f_body, if (expanded) pal.accent else pal.text2, if (expanded) "⌃" else "⌄", rc.right - S(32), rc.top, S(20), h, DT_V | DT_CENTER);
     } else {
