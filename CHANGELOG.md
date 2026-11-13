@@ -5,6 +5,13 @@ and versions follow the `DEPTH.ITERATION` scheme described in `AGENTS.md`.
 
 ## [Unreleased]
 
+## [1.8] — 2026-11-13
+
+### Fixed
+
+- `serve` ignores a UTF-8 byte-order mark at the start of an input line. A redirected
+  stdin stream can emit one, which made the first command fail with `UnknownCommand`.
+
 ## [1.7] — 2026-11-13
 
 ### Added
