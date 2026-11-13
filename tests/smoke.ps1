@@ -106,6 +106,18 @@ try {
     $rows = Invoke-Cli table list --session $session
     if ($rows.count -ne 1) { throw "table list returned $($rows.count) rows" }
 
+    $pointer = Invoke-Cli pointer scan --addr $addr --max-depth 2 --max-offset 0x1000 --session $session
+    if ($pointer.count -lt 1) { throw "pointer scan found no chain to $addr" }
+    if (-not $pointer.chains[0].base -or -not $pointer.chains[0].offsets) {
+        throw "pointer scan returned an incomplete chain: $($pointer | ConvertTo-Json -Compress)"
+    }
+    $ptrAdded = Invoke-Cli table add --from-pointer 0 --type int32 --desc pointer --session $session
+    if ($ptrAdded.address -ne $addr) {
+        throw "table add --from-pointer resolved $($ptrAdded.address), expected $addr"
+    }
+    $rows = Invoke-Cli table list --session $session
+    if ($rows.count -ne 2) { throw "table list returned $($rows.count) rows after adding a pointer chain" }
+
     $strScan = Invoke-Cli scan first --type string --value memfract-needle --module fixture.exe --session $session
     if ($strScan.count -lt 1) { throw "string scan found nothing" }
     $strList = Invoke-Cli scan list --limit 10000 --session $session

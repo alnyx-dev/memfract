@@ -1,6 +1,7 @@
 const std = @import("std");
 const win = @import("win.zig");
 const scan = @import("scan.zig");
+const pointer = @import("pointer.zig");
 const json = @import("json.zig");
 const util = @import("util.zig");
 
@@ -50,11 +51,11 @@ fn exitCodeFor(e: anyerror) u8 {
 }
 
 const value_opts = [_][]const u8{
-    "--pid",       "--process", "--type",   "--cond",    "--value",   "--value2",   "--addr",
-    "--size",      "--limit",   "--offset", "--session", "--filter",  "--for",      "--interval",
-    "--count",     "--desc",    "--index",  "--file",    "--timeout", "--offsets",  "--tol",
-    "--from-scan", "--module",  "--start",  "--end",     "--align",   "--encoding", "--threads",
-    "--id",
+    "--pid",       "--process",   "--type",       "--cond",        "--value",        "--value2",   "--addr",
+    "--size",      "--limit",     "--offset",     "--session",     "--filter",       "--for",      "--interval",
+    "--count",     "--desc",      "--index",      "--file",        "--timeout",      "--offsets",  "--tol",
+    "--from-scan", "--module",    "--start",      "--end",         "--align",        "--encoding", "--threads",
+    "--id",        "--max-depth", "--max-offset", "--max-results", "--from-pointer",
 };
 
 fn takesValue(t: []const u8) bool {
@@ -156,6 +157,7 @@ const Session = struct {
     freezes: std.ArrayList(*FreezeJob) = .empty,
     watches: std.ArrayList(*WatchJob) = .empty,
     next_job_id: u32 = 1,
+    pointers: ?pointer.Result = null,
 };
 
 fn W(comptime s: []const u8) []const u16 {
@@ -219,6 +221,9 @@ const Cur = struct {
     fn u64_(self: *Cur) !u64 {
         return std.mem.readInt(u64, (try self.take(8))[0..8], .little);
     }
+    fn i64_(self: *Cur) !i64 {
+        return std.mem.readInt(i64, (try self.take(8))[0..8], .little);
+    }
 };
 
 fn putInt(a: std.mem.Allocator, list: *std.ArrayList(u8), comptime T: type, v: T) !void {
@@ -229,15 +234,17 @@ fn putInt(a: std.mem.Allocator, list: *std.ArrayList(u8), comptime T: type, v: T
 
 const session_magic_v2 = "ZCS2";
 const session_magic_v3 = "ZCS3";
-const session_magic = "ZCS4";
+const session_magic_v4 = "ZCS4";
+const session_magic = "ZCS5";
 
 fn decodeSession(data: []const u8, s: *Session) !void {
     var c: Cur = .{ .d = data };
     const magic = try c.take(4);
-    const v4 = std.mem.eql(u8, magic, session_magic);
+    const v5 = std.mem.eql(u8, magic, session_magic);
+    const v4 = std.mem.eql(u8, magic, session_magic_v4);
     const v3 = std.mem.eql(u8, magic, session_magic_v3);
     const v2 = std.mem.eql(u8, magic, session_magic_v2);
-    if (!v4 and !v3 and !v2) return error.CorruptSession;
+    if (!v5 and !v4 and !v3 and !v2) return error.CorruptSession;
 
     s.pid = try c.u32_();
     s.ctime = try c.u64_();
@@ -248,7 +255,7 @@ fn decodeSession(data: []const u8, s: *Session) !void {
     s.sc.kind = std.enums.fromInt(scan.Kind, kind_i) orelse return error.CorruptSession;
 
     var value_len: usize = 0;
-    if (v4) {
+    if (v5 or v4) {
         const vlen = try c.u64_();
         if (s.sc.kind.isVariable()) {
             if (vlen == 0 or vlen > scan.max_value_len) return error.CorruptSession;
@@ -295,6 +302,35 @@ fn decodeSession(data: []const u8, s: *Session) !void {
         const d = try gpa.dupe(u8, util.cleanUtf8(raw_desc));
         try s.table.append(gpa, .{ .addr = addr, .kind = k, .desc = d });
     }
+
+    if (!v5) return;
+    if ((try c.u8_()) == 0) return;
+
+    var ps: pointer.Result = .{};
+    errdefer ps.deinit(gpa);
+    ps.target = @intCast(try c.u64_());
+    ps.truncated = (try c.u8_()) != 0;
+    ps.canceled = (try c.u8_()) != 0;
+    ps.slots = @intCast(try c.u64_());
+
+    const chains = try c.u64_();
+    if (chains > (data.len - c.p) / 10) return error.CorruptSession;
+    try ps.chains.ensureTotalCapacity(gpa, @intCast(chains));
+    var ci: u64 = 0;
+    while (ci < chains) : (ci += 1) {
+        const base = try c.u64_();
+        const len = try c.u8_();
+        if (len == 0 or len > pointer.max_depth) return error.CorruptSession;
+        var chain: pointer.Chain = .{ .base = @intCast(base), .len = len };
+        for (0..len) |k| chain.offsets[k] = try c.i64_();
+        ps.chains.appendAssumeCapacity(chain);
+    }
+    s.pointers = ps;
+}
+
+fn clearPointers(s: *Session) void {
+    if (s.pointers) |*p| p.deinit(gpa);
+    s.pointers = null;
 }
 
 fn freeSession(s: *Session) void {
@@ -303,6 +339,7 @@ fn freeSession(s: *Session) void {
     s.watches.deinit(gpa);
     s.sc.deinit(gpa);
     if (s.undo) |*u| u.deinit(gpa);
+    clearPointers(s);
     for (s.table.items) |row| gpa.free(row.desc);
     s.table.deinit(gpa);
 }
@@ -337,6 +374,20 @@ fn encodeSession(a: std.mem.Allocator, s: *Session) ![]u8 {
         try out.append(a, @backingInt(row.kind));
         try putInt(a, &out, u16, @as(u16, @intCast(row.desc.len)));
         try out.appendSlice(a, row.desc);
+    }
+
+    try out.append(a, @intFromBool(s.pointers != null));
+    if (s.pointers) |*ps| {
+        try putInt(a, &out, u64, ps.target);
+        try out.append(a, @intFromBool(ps.truncated));
+        try out.append(a, @intFromBool(ps.canceled));
+        try putInt(a, &out, u64, ps.slots);
+        try putInt(a, &out, u64, ps.chains.items.len);
+        for (ps.chains.items) |chain| {
+            try putInt(a, &out, u64, chain.base);
+            try out.append(a, chain.len);
+            for (chain.offsetsSlice()) |off| try putInt(a, &out, i64, off);
+        }
     }
     return out.toOwnedSlice(a);
 }
@@ -570,6 +621,7 @@ fn attachPid(a: std.mem.Allocator, s: *Session, pid: u32) !void {
         s.sc = .{};
         s.scanned = false;
         clearUndo(a, s);
+        clearPointers(s);
     }
     s.proc = p;
     s.pid = pid;
@@ -667,6 +719,52 @@ fn threadsArg(args: Args) !usize {
     if (n == 0 or n > scan.max_threads)
         return fail(error.BadArgs, "--threads must be between 1 and {d}", .{scan.max_threads});
     return @intCast(n);
+}
+
+fn maxDepthArg(args: Args) !usize {
+    const t = args.opt("--max-depth") orelse return pointer.default_max_depth;
+    const n = try parseU64(t);
+    if (n == 0 or n > pointer.max_depth)
+        return fail(error.BadArgs, "--max-depth must be between 1 and {d}", .{pointer.max_depth});
+    return @intCast(n);
+}
+
+fn maxOffsetArg(args: Args) !u64 {
+    const t = args.opt("--max-offset") orelse return pointer.default_max_offset;
+    const n = try parseU64(t);
+    if (n == 0 or n > 0x7FFF_FFFF)
+        return fail(error.BadArgs, "--max-offset must be between 1 and 0x7FFFFFFF", .{});
+    return n;
+}
+
+fn maxResultsArg(args: Args) !usize {
+    const t = args.opt("--max-results") orelse return pointer.default_max_results;
+    const n = try parseU64(t);
+    if (n == 0 or n > pointer.max_results_limit)
+        return fail(error.BadArgs, "--max-results must be between 1 and {d}", .{pointer.max_results_limit});
+    return @intCast(n);
+}
+
+fn offsetString(buf: *[24]u8, off: i64) []const u8 {
+    const magnitude: u64 = @abs(off);
+    return if (off < 0)
+        std.fmt.bufPrint(buf, "-0x{X}", .{magnitude}) catch ""
+    else
+        std.fmt.bufPrint(buf, "0x{X}", .{magnitude}) catch "";
+}
+
+fn moduleExpr(mods: []const win.ModEntry, addr: usize, buf: []u8) []const u8 {
+    for (mods) |m| {
+        if (addr >= m.base and addr - m.base < m.size) {
+            return std.fmt.bufPrint(buf, "{s}+0x{X}", .{ m.name[0..m.name_len], addr - m.base }) catch "";
+        }
+    }
+    var ab: [24]u8 = undefined;
+    return std.fmt.bufPrint(buf, "{s}", .{hexAddr(&ab, addr)}) catch "";
+}
+
+fn staticRangeLess(_: void, x: pointer.StaticRange, y: pointer.StaticRange) bool {
+    return x.base < y.base;
 }
 
 fn scanRange(a: std.mem.Allocator, s: *Session, args: Args) !scan.Range {
@@ -893,6 +991,7 @@ const help_entries = [_]HelpEntry{
     .{ .name = "scan reset", .usage = "scan reset", .desc = "Discard scan results; the previous result set stays available to 'scan undo'." },
     .{ .name = "scan undo", .usage = "scan undo", .desc = "Restore the result set that was active before the last scan first, scan next, scan reset or scan snapshot load." },
     .{ .name = "scan snapshot", .usage = "scan snapshot save|load --file PATH", .desc = "Save the result set to a ZSN1 snapshot file, or replace the current results (and target identity) with one. Loading keeps the current results available to 'scan undo'." },
+    .{ .name = "pointer scan", .usage = "pointer scan --addr A [--max-depth N] [--max-offset X] [--module NAME] [--max-results N] [--timeout MS]", .desc = "Find pointer chains that end at A. Chains start at a static address in a loaded module and are written as base plus --offsets. --max-depth N (1..32, default 3) limits the number of offsets, --max-offset X (default 0x1000) limits each step, --module NAME restricts the base to one module, --max-results N (default 1000) caps the list. A cap or a timeout sets truncated or canceled." },
     .{ .name = "freeze", .usage = "freeze --addr A --value V [--type T] [--offsets ...] [--for MS] [--interval MS] [--timeout MS]", .desc = "Keep writing a value for the given time (blocking). Ctrl+C stops early; --timeout MS caps the duration." },
     .{ .name = "freeze start", .usage = "freeze start --addr A --value V [--type T] [--offsets ...] [--interval MS] [--for MS]", .desc = "serve only: write a value in the background until 'freeze stop'. Returns the job id; --for MS stops it automatically." },
     .{ .name = "freeze stop", .usage = "freeze stop (--id N | --all)", .desc = "serve only: stop background freeze jobs and return their final write counters." },
@@ -902,7 +1001,7 @@ const help_entries = [_]HelpEntry{
     .{ .name = "watch poll", .usage = "watch poll --id N", .desc = "serve only: return the samples collected since the previous poll and clear them." },
     .{ .name = "watch stop", .usage = "watch stop (--id N | --all)", .desc = "serve only: stop one background watch job and return its unpolled samples, or stop all (--all) with pending counts." },
     .{ .name = "watch list", .usage = "watch list", .desc = "serve only: list background watch jobs with pending sample counts." },
-    .{ .name = "table add", .usage = "table add (--addr A [--type T] [--offsets ...] | --from-scan INDEX) [--desc TEXT]", .desc = "Save an address in the session table." },
+    .{ .name = "table add", .usage = "table add (--addr A [--type T] [--offsets ...] | --from-scan INDEX | --from-pointer INDEX) [--desc TEXT]", .desc = "Save an address in the session table. --from-pointer resolves a chain found by 'pointer scan' and saves the address it currently reaches; pass --type for its value type." },
     .{ .name = "table list", .usage = "table list", .desc = "Show saved addresses with live values." },
     .{ .name = "table write", .usage = "table write --index N --value V", .desc = "Write a value to a saved address." },
     .{ .name = "table remove", .usage = "table remove --index N", .desc = "Remove a saved address." },
@@ -925,7 +1024,8 @@ const help_notes = [_][]const u8{
     "First scans read memory on all CPU cores and use vectorized exact matching for integer types; --threads N overrides the worker count. Scan responses include regions_scanned (regions for scan first, read windows for scan next), bytes_read (bytes actually read) and elapsed_ms. A failed block read falls back to 4 KB pages.",
     "Run as Administrator to open most processes. Not for use against online games or protected processes.",
     "Session files are written atomically. If a saved session is corrupt it is moved to <name>.session.corrupt, a fresh session is started, and the response includes a 'notice' field.",
-    "Long-running commands (scan, freeze, watch) stop on Ctrl+C and return a normal JSON response; freeze and watch also accept --timeout MS as an upper bound.",
+    "Long-running commands (scan, pointer scan, freeze, watch) stop on Ctrl+C and return a normal JSON response; scan, pointer scan, freeze and watch also accept --timeout MS as an upper bound.",
+    "pointer scan builds an index of pointer-sized values in readable memory, then walks it backwards from --addr until it reaches a static address in a loaded module. Each result is a base address plus offsets in the form --addr BASE --offsets o1,o2. Results stay in the session for 'table add --from-pointer INDEX'; detaching or switching to another PID discards them.",
     "Background freeze and watch are available only in 'serve': 'freeze start|stop|list' and 'watch start|poll|stop|list'. A background watch keeps up to 10000 samples between polls and reports the rest as dropped; detaching or switching the target stops every background job.",
 };
 
@@ -1018,6 +1118,7 @@ fn cmdDetach(a: std.mem.Allocator, s: *Session, w: *json.Writer) !void {
     s.sc = .{};
     s.scanned = false;
     clearUndo(a, s);
+    clearPointers(s);
     s.dirty = true;
     try w.kvBool("detached", true);
 }
@@ -1251,6 +1352,7 @@ fn cmdSnapshot(a: std.mem.Allocator, s: *Session, args: Args, w: *json.Writer) !
     }
 
     stashUndo(a, s);
+    if (meta.pid != 0 and s.pid != 0 and meta.pid != s.pid) clearPointers(s);
     s.sc.deinit(gpa);
     s.sc = snap;
     s.scanned = meta.scanned;
@@ -1262,6 +1364,84 @@ fn cmdSnapshot(a: std.mem.Allocator, s: *Session, args: Args, w: *json.Writer) !
     try w.kvStr("file", path);
     try w.kvStr("type", @tagName(s.sc.kind));
     try w.kvInt("count", s.sc.matches.items.len);
+}
+
+fn cmdPointer(a: std.mem.Allocator, s: *Session, args: Args, w: *json.Writer) !void {
+    const sub = args.pos(1) orelse return fail(error.BadArgs, "pointer needs a subcommand: scan", .{});
+    if (!std.mem.eql(u8, sub, "scan"))
+        return fail(error.BadArgs, "unknown pointer subcommand '{s}'", .{sub});
+
+    const p = try getProc(a, s, args);
+    const addr_text = args.opt("--addr") orelse return fail(error.BadArgs, "missing --addr", .{});
+    const target = try parseAddrText(a, s, addr_text);
+    const opts: pointer.Options = .{
+        .target = target,
+        .max_depth = try maxDepthArg(args),
+        .max_offset = try maxOffsetArg(args),
+        .max_results = try maxResultsArg(args),
+    };
+    const timeout = try timeoutArg(args);
+
+    var mods: std.ArrayList(win.ModEntry) = .empty;
+    defer mods.deinit(a);
+    win.enumModules(a, s.pid, &mods) catch
+        return fail(error.SnapshotFailed, "cannot enumerate modules of PID {d}", .{s.pid});
+
+    var ranges: std.ArrayList(pointer.StaticRange) = .empty;
+    defer ranges.deinit(a);
+    if (args.opt("--module")) |name| {
+        for (mods.items) |m| {
+            if (!eqlIC(m.name[0..m.name_len], name)) continue;
+            try ranges.append(a, .{ .base = m.base, .size = m.size });
+            break;
+        } else return fail(error.NotFound, "module '{s}' not found in the process", .{name});
+    } else {
+        for (mods.items) |m| try ranges.append(a, .{ .base = m.base, .size = m.size });
+    }
+    std.sort.pdq(pointer.StaticRange, ranges.items, {}, staticRangeLess);
+
+    clearPointers(s);
+    startWatchdog(timeout);
+    const t0 = GetTickCount64();
+    var local = p;
+    const res = pointer.find(gpa, scan.processSource(&local), ranges.items, opts) catch |e| {
+        stopWatchdog();
+        return e;
+    };
+    stopWatchdog();
+
+    s.pointers = res;
+    s.dirty = true;
+
+    const ps = &s.pointers.?;
+    var ab: [24]u8 = undefined;
+    try w.kvInt("pid", s.pid);
+    try w.kvStr("address", hexAddr(&ab, target));
+    try w.kvInt("count", ps.chains.items.len);
+    try w.kvBool("truncated", ps.truncated);
+    try w.kvBool("canceled", ps.canceled);
+    try w.kvInt("slots", ps.slots);
+    try w.kvInt("bytes_read", ps.bytes_read);
+    try w.kvInt("elapsed_ms", GetTickCount64() - t0);
+    try w.kvInt("max_depth", opts.max_depth);
+    try w.kvInt("max_offset", opts.max_offset);
+    try w.key("chains");
+    try w.arrayBegin();
+    var mb: [840]u8 = undefined;
+    for (ps.chains.items, 0..) |chain, i| {
+        try w.objectBegin();
+        try w.kvInt("index", i);
+        try w.kvInt("depth", chain.len);
+        try w.kvStr("base_address", hexAddr(&ab, chain.base));
+        try w.kvStr("base", moduleExpr(mods.items, chain.base, &mb));
+        try w.key("offsets");
+        try w.arrayBegin();
+        var ob: [24]u8 = undefined;
+        for (chain.offsetsSlice()) |off| try w.string(offsetString(&ob, off));
+        try w.arrayEnd();
+        try w.objectEnd();
+    }
+    try w.arrayEnd();
 }
 
 const max_watch_pending = 10_000;
@@ -1850,7 +2030,22 @@ fn cmdTable(a: std.mem.Allocator, s: *Session, args: Args, w: *json.Writer) !voi
     if (std.mem.eql(u8, sub, "add")) {
         var addr: u64 = 0;
         var kind: scan.Kind = .int32;
-        if (args.opt("--from-scan")) |t| {
+        var saved_chain: ?pointer.Chain = null;
+        if (args.opt("--from-pointer")) |t| {
+            if (args.opt("--from-scan") != null)
+                return fail(error.BadArgs, "--from-pointer cannot be combined with --from-scan", .{});
+            const idx: usize = @intCast(try parseU64(t));
+            const ps = s.pointers orelse
+                return fail(error.NoPointerScan, "no pointer scan results: run 'pointer scan' first", .{});
+            if (idx >= ps.chains.items.len) return fail(error.NotFound, "no pointer chain with index {d}", .{idx});
+            const p = try getProc(a, s, args);
+            var local = p;
+            const chain = ps.chains.items[idx];
+            addr = pointer.resolve(scan.processSource(&local), chain) catch
+                return fail(error.ReadFailed, "cannot follow the pointer chain at 0x{X}", .{chain.base});
+            kind = try fixedKindArg(args);
+            saved_chain = chain;
+        } else if (args.opt("--from-scan")) |t| {
             const idx: usize = @intCast(try parseU64(t));
             if (!s.scanned or idx >= s.sc.matches.items.len) return fail(error.NotFound, "no scan result with index {d}", .{idx});
             addr = s.sc.matches.items[idx].addr;
@@ -1869,6 +2064,17 @@ fn cmdTable(a: std.mem.Allocator, s: *Session, args: Args, w: *json.Writer) !voi
         var ab: [24]u8 = undefined;
         try w.kvInt("index", s.table.items.len - 1);
         try w.kvStr("address", hexAddr(&ab, addr));
+        if (saved_chain) |chain| {
+            try w.key("chain");
+            try w.objectBegin();
+            try w.kvStr("base_address", hexAddr(&ab, chain.base));
+            try w.key("offsets");
+            try w.arrayBegin();
+            var ob: [24]u8 = undefined;
+            for (chain.offsetsSlice()) |off| try w.string(offsetString(&ob, off));
+            try w.arrayEnd();
+            try w.objectEnd();
+        }
     } else if (std.mem.eql(u8, sub, "list")) {
         const p: ?win.Process = getProc(a, s, args) catch null;
         try w.kvInt("count", s.table.items.len);
@@ -1967,6 +2173,7 @@ fn dispatch(a: std.mem.Allocator, s: *Session, argv: []const []const u8, w: *jso
     if (eq(u8, cmd, "read")) return cmdRead(a, s, args, w);
     if (eq(u8, cmd, "write")) return cmdWrite(a, s, args, w);
     if (eq(u8, cmd, "scan")) return cmdScan(a, s, args, w);
+    if (eq(u8, cmd, "pointer")) return cmdPointer(a, s, args, w);
     if (eq(u8, cmd, "freeze")) return cmdFreeze(a, s, args, w);
     if (eq(u8, cmd, "watch")) return cmdWatch(a, s, args, w);
     if (eq(u8, cmd, "table")) return cmdTable(a, s, args, w);
@@ -2319,9 +2526,9 @@ test "session roundtrip keeps matches and table" {
     const data = try encodeSession(a, &s);
     defer a.free(data);
 
-    try std.testing.expectEqualStrings("ZCS4", data[0..4]);
-    // header 28 + 2 int32 records of 12 bytes + rows count 4 + row 17
-    try std.testing.expectEqual(@as(usize, 81), data.len);
+    try std.testing.expectEqualStrings("ZCS5", data[0..4]);
+    // header 28 + 2 int32 records of 12 bytes + rows count 4 + row 17 + pointer flag
+    try std.testing.expectEqual(@as(usize, 82), data.len);
 
     var t: Session = .{ .name = "roundtrip" };
     defer freeSession(&t);
@@ -2340,6 +2547,58 @@ test "session roundtrip keeps matches and table" {
     try std.testing.expectEqual(@as(u64, 0x3000), t.table.items[0].addr);
     try std.testing.expectEqual(scan.Kind.float64, t.table.items[0].kind);
     try std.testing.expectEqualStrings("health", t.table.items[0].desc);
+}
+
+test "session roundtrip keeps pointer chains" {
+    const a = std.testing.allocator;
+    var s: Session = .{ .name = "pointers" };
+    defer freeSession(&s);
+    s.pid = 77;
+    var ps: pointer.Result = .{ .target = 0x11000, .truncated = true, .canceled = false, .slots = 1234 };
+    var chain: pointer.Chain = .{ .base = 0x1020, .len = 2 };
+    chain.offsets[0] = 0x40;
+    chain.offsets[1] = -0x80;
+    try ps.chains.append(gpa, chain);
+    s.pointers = ps;
+
+    const data = try encodeSession(a, &s);
+    defer a.free(data);
+
+    var t: Session = .{ .name = "pointers" };
+    defer freeSession(&t);
+    try decodeSession(data, &t);
+
+    const got = &t.pointers.?;
+    try std.testing.expectEqual(@as(usize, 0x11000), got.target);
+    try std.testing.expect(got.truncated);
+    try std.testing.expect(!got.canceled);
+    try std.testing.expectEqual(@as(usize, 1234), got.slots);
+    try std.testing.expectEqual(@as(usize, 1), got.chains.items.len);
+    try std.testing.expectEqual(@as(usize, 0x1020), got.chains.items[0].base);
+    try std.testing.expectEqual(@as(i64, 0x40), got.chains.items[0].offsets[0]);
+    try std.testing.expectEqual(@as(i64, -0x80), got.chains.items[0].offsets[1]);
+}
+
+test "decodeSession accepts legacy ZCS4 files without pointer results" {
+    const a = std.testing.allocator;
+    var buf: std.ArrayList(u8) = .empty;
+    defer buf.deinit(a);
+    try buf.appendSlice(a, "ZCS4");
+    try putInt(a, &buf, u32, 7);
+    try putInt(a, &buf, u64, 9);
+    try buf.append(a, @backingInt(scan.Kind.int32));
+    try buf.append(a, 1);
+    try buf.append(a, 0);
+    try buf.append(a, 0);
+    try putInt(a, &buf, u64, 4);
+    try putInt(a, &buf, u64, 0);
+    try putInt(a, &buf, u32, 0);
+
+    var t: Session = .{ .name = "legacy4" };
+    defer freeSession(&t);
+    try decodeSession(buf.items, &t);
+    try std.testing.expectEqual(@as(u32, 7), t.pid);
+    try std.testing.expect(t.pointers == null);
 }
 
 test "decodeSession rejects truncated data" {
@@ -2443,7 +2702,7 @@ test "session roundtrip keeps string scans" {
 
     const data = try encodeSession(a, &s);
     defer a.free(data);
-    try std.testing.expectEqualStrings("ZCS4", data[0..4]);
+    try std.testing.expectEqualStrings("ZCS5", data[0..4]);
 
     var t: Session = .{ .name = "strings" };
     defer freeSession(&t);
