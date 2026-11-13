@@ -2040,6 +2040,10 @@ fn tokenize(a: std.mem.Allocator, line: []const u8) ![]const []const u8 {
 
 var line_buf: [16384]u8 = undefined;
 
+fn stripBom(s: []const u8) []const u8 {
+    return if (std.mem.startsWith(u8, s, "\xEF\xBB\xBF")) s[3..] else s;
+}
+
 fn serve() void {
     var s: Session = .{ .name = "serve", .file_backed = false, .serve = true };
     {
@@ -2061,7 +2065,7 @@ fn serve() void {
         const a = arena.allocator();
         var w = json.Writer.init(a);
 
-        const trimmed = std.mem.trim(u8, line, " \t");
+        const trimmed = std.mem.trim(u8, stripBom(std.mem.trim(u8, line, " \t")), " \t");
         if (trimmed.len == 0) continue;
         if (std.mem.eql(u8, trimmed, "exit") or std.mem.eql(u8, trimmed, "quit")) {
             win.writeStdout("{\"ok\":true,\"bye\":true}\n");
@@ -2165,6 +2169,13 @@ test "tokenize handles quotes and escapes" {
 
     const e = try tokenize(a, "write --desc \"a\\\"b\"");
     try std.testing.expectEqualStrings("a\"b", e[2]);
+}
+
+test "stripBom removes the UTF-8 preamble" {
+    try std.testing.expectEqualStrings("attach --pid 1", stripBom("\xEF\xBB\xBFattach --pid 1"));
+    try std.testing.expectEqualStrings("attach --pid 1", stripBom("attach --pid 1"));
+    try std.testing.expectEqualStrings("", stripBom(""));
+    try std.testing.expectEqualStrings("\xEF\xBBattach", stripBom("\xEF\xBBattach"));
 }
 
 test "hexAddr is fixed width" {
