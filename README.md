@@ -28,8 +28,8 @@ or a native Win32 GUI.
   SIMD, and `scan next` filters nearby results through shared read windows.
 - **The types you need.** Signed and unsigned integers from 8 to 64 bits, floats, UTF-8
   and UTF-16LE strings, and wildcard byte patterns.
-- **Real workflow tools.** Undo, snapshots, delta scans, pointer chains, an address table,
-  blocking freeze/watch, and background jobs in `serve`.
+- **Real workflow tools.** Undo, snapshots, delta scans, pointer scanning, an address
+  table, blocking freeze/watch, and background jobs in `serve`.
 - **Two front ends, one engine.** The same scanner powers the automation CLI and the
   native GUI.
 
@@ -94,7 +94,7 @@ memfract scan first --type bytes --value "48 8B ?? ?? 89"
 |---|---|
 | Processes | `ps`, `modules`, `regions`, `attach`, `detach` |
 | Memory | `read`, `write` |
-| Scanning | `scan first`, `scan next`, `scan list`, `scan status`, `scan reset`, `scan undo`, `scan snapshot` |
+| Scanning | `scan first`, `scan next`, `scan list`, `scan status`, `scan reset`, `scan undo`, `scan snapshot`, `pointer scan` |
 | Live values | `freeze`, `watch` |
 | Address table | `table add`, `table list`, `table write`, `table remove`, `table clear`, `table save`, `table load` |
 | Sessions | `help`, `version`, `serve` |
@@ -147,9 +147,33 @@ One-shot commands keep their state in `%TEMP%\memfract\<session>.session`. Use
 are written atomically; a corrupt file is moved to `<name>.session.corrupt`, a fresh
 session starts, and the response includes a `notice` field.
 
-Long-running commands (`scan`, `freeze`, `watch`) stop on `Ctrl+C` and still return a
-normal JSON response. `freeze` and `watch` also accept `--timeout MS` and report
+Long-running commands (`scan`, `pointer scan`, `freeze`, `watch`) stop on `Ctrl+C` and
+still return a normal JSON response. `scan`, `pointer scan`, `freeze`, and `watch` also
+accept `--timeout MS` as an upper bound; `pointer scan`, `freeze`, and `watch` report
 `"canceled": true` when stopped early.
+
+## Pointer scanner
+
+Absolute addresses change when the target restarts. A pointer chain keeps the value
+reachable through a static address in a module:
+
+```powershell
+memfract pointer scan --addr 0x0000000012345678 --max-depth 3 --max-offset 0x1000
+memfract table add --from-pointer 0 --type int32 --desc "player health"
+memfract read --addr game.exe+0x1A2B3C --offsets 0x10,-0x8 --type int32
+```
+
+The scan walks readable memory backwards from `--addr` and stops when a pointer slot
+lies inside a loaded module. Results are printed as a module-relative base and a list of
+offsets, which is exactly what `--addr` and `--offsets` accept. `--module NAME` restricts
+the base to one module, `--max-depth` limits the number of offsets (default 3), and
+`--max-offset` limits the distance covered by one step (default `0x1000`).
+
+The response reports `count`, `truncated`, `canceled`, `slots`, `bytes_read`, and
+`elapsed_ms`. `--max-results` caps the chain list, `--timeout MS` and `Ctrl+C` stop the
+walk early, and hitting a budget sets `truncated` instead of failing. Chains stay in the
+session for `table add --from-pointer INDEX`; `detach` and switching to another PID
+discard them.
 
 ## Serve mode
 
@@ -253,6 +277,8 @@ that may be missing on older machines.
   scan.
 - Matches are strictly ascending and duplicate-free; the session decoder rejects anything
   else because filtering depends on that invariant.
+- `pointer scan` indexes pointer-sized values from readable memory, then walks that index
+  backwards in breadth-first order so shorter chains are reported first.
 
 <details>
 <summary>Project layout</summary>
@@ -262,6 +288,7 @@ src/
   cli.zig       JSON CLI, serve mode, sessions, address table
   gui.zig       Win32/GDI+ GUI
   scan.zig      scanning and value comparison engine
+  pointer.zig   pointer-chain search over a memory source
   bench.zig     benchmark over synthetic memory regions
   util.zig      number parsing, UTF-8 handling, table file format
   json.zig      minimal JSON writer

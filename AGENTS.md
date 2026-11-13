@@ -31,6 +31,7 @@ the output is a repeatable MiB/s figure, not a pass/fail check.
 |------|------|
 | `src/win.zig` | Thin Win32 wrapper: `Process` (open/read/write/regions/modules), process listing, console and file I/O, atomic file write. All `extern` declarations live here. |
 | `src/scan.zig` | `Scanner`: `first` / `next`, `Kind` (int32 int64 float32 float64), `Cond`, value encode/format/compare. No I/O, no UI. |
+| `src/pointer.zig` | Pointer-chain search over a `scan.Source`: pointer index, breadth-first walk, chain resolve. No I/O, no UI. |
 | `src/bench.zig` | Benchmark over synthetic memory regions (`zig build bench`). |
 | `src/cli.zig` | One-shot commands and `serve` mode. Command table (`HelpEntry`), arg parsing, JSON responses, session save/load. |
 | `src/gui.zig` | Win32 GUI. Scans run on a worker thread. |
@@ -50,7 +51,7 @@ the output is a repeatable MiB/s figure, not a pass/fail check.
   command or flag, update the table and the known-flags list near the top: `help` is the
   machine-readable documentation that other tools rely on.
 - State persists between one-shot calls in `<name>.session` files (`--session NAME`).
-  The file format starts with a magic (`ZCS4`, legacy `ZCS3` and `ZCS2` are still
+  The file format starts with a magic (`ZCS5`, legacy `ZCS4`, `ZCS3` and `ZCS2` are still
   readable). Change the layout only together with a new magic and, where possible, a
   decoder for the old one.
 - The undo history is a `ZSN1` snapshot at `<name>.session.undo`, written before
@@ -87,6 +88,18 @@ the output is a repeatable MiB/s figure, not a pass/fail check.
 - Writable-only region listing excludes `MEM_MAPPED`; `--all` includes it.
 - Float "exact" uses a tolerance derived from the typed text (`util.tolFromText`), not
   bitwise equality.
+
+## Pointer scanner invariants
+
+- `pointer scan` indexes 8-byte aligned pointer values from readable memory and walks the
+  index backwards from `--addr`. A chain ends at a slot inside a loaded module; the
+  result is that slot plus offsets in `--offsets` order.
+- The walk is breadth-first so shorter chains come first. Cycles are cut by rejecting a
+  slot address that already appears in the current path.
+- `max_results`, `max_slots` and `max_steps` set `truncated`; Ctrl+C and `--timeout` set
+  `canceled` and keep the chains found so far.
+- Chains live in the session (`ZCS5`) for `table add --from-pointer`. Detaching, switching
+  to another PID, or loading a snapshot for another PID clears them.
 
 ## GUI rules
 

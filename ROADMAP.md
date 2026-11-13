@@ -11,7 +11,7 @@ scripts or session files bump the depth.
 | 1.5 | Scan performance |
 | 1.6 | Undo and snapshots |
 | 1.7 | Background freeze and watch in `serve` |
-| 1.8 | Pointer scanner |
+| 1.9 | Pointer scanner |
 | 2.0 | Contract cleanup (breaking) |
 | 2.1 | CLI usability and JSON schema |
 | 2.2 | 32-bit targets and memory protection |
@@ -51,7 +51,7 @@ scripts or session files bump the depth.
 - `watch start|poll|stop` accumulates changes and returns them on `poll`.
 - One-shot `freeze` and `watch` stay blocking.
 
-## 1.8: pointer scanner
+## 1.9: pointer scanner
 
 - `pointer scan --addr A [--max-depth N] [--max-offset X] [--module NAME]` finds chains
   ending at `A`, in the form `--offsets` accepts.
