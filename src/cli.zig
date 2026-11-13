@@ -45,7 +45,7 @@ fn fail(e: anyerror, comptime fmt: []const u8, args: anytype) anyerror {
 }
 
 fn exitCodeFor(e: anyerror) u8 {
-    if (e == error.BadArgs or e == error.UnknownCommand) return 2;
+    if (e == error.BadArgs or e == error.UnknownCommand or e == error.ServeOnly) return 2;
     return 1;
 }
 
@@ -54,6 +54,7 @@ const value_opts = [_][]const u8{
     "--size",      "--limit",   "--offset", "--session", "--filter",  "--for",      "--interval",
     "--count",     "--desc",    "--index",  "--file",    "--timeout", "--offsets",  "--tol",
     "--from-scan", "--module",  "--start",  "--end",     "--align",   "--encoding", "--threads",
+    "--id",
 };
 
 fn takesValue(t: []const u8) bool {
@@ -151,6 +152,10 @@ const Session = struct {
     /// Serve keeps one-shot state in memory; undo history then never touches disk.
     file_backed: bool = true,
     undo: ?scan.Scanner = null,
+    serve: bool = false,
+    freezes: std.ArrayList(*FreezeJob) = .empty,
+    watches: std.ArrayList(*WatchJob) = .empty,
+    next_job_id: u32 = 1,
 };
 
 fn W(comptime s: []const u8) []const u16 {
@@ -293,6 +298,9 @@ fn decodeSession(data: []const u8, s: *Session) !void {
 }
 
 fn freeSession(s: *Session) void {
+    stopAllJobs(s);
+    s.freezes.deinit(gpa);
+    s.watches.deinit(gpa);
     s.sc.deinit(gpa);
     if (s.undo) |*u| u.deinit(gpa);
     for (s.table.items) |row| gpa.free(row.desc);
@@ -557,6 +565,7 @@ fn attachPid(a: std.mem.Allocator, s: *Session, pid: u32) !void {
     if (s.proc) |old| old.close();
     const changed = s.pid != pid or s.ctime != ct;
     if (s.pid != pid) {
+        stopAllJobs(s);
         s.sc.deinit(gpa);
         s.sc = .{};
         s.scanned = false;
@@ -885,7 +894,14 @@ const help_entries = [_]HelpEntry{
     .{ .name = "scan undo", .usage = "scan undo", .desc = "Restore the result set that was active before the last scan first, scan next, scan reset or scan snapshot load." },
     .{ .name = "scan snapshot", .usage = "scan snapshot save|load --file PATH", .desc = "Save the result set to a ZSN1 snapshot file, or replace the current results (and target identity) with one. Loading keeps the current results available to 'scan undo'." },
     .{ .name = "freeze", .usage = "freeze --addr A --value V [--type T] [--offsets ...] [--for MS] [--interval MS] [--timeout MS]", .desc = "Keep writing a value for the given time (blocking). Ctrl+C stops early; --timeout MS caps the duration." },
-    .{ .name = "watch", .usage = "watch --addr A [--type T] [--offsets ...] [--interval MS] [--count N] [--timeout MS] [--changes-only]", .desc = "Sample a value repeatedly. Ctrl+C stops early; --timeout MS caps the total time." },
+    .{ .name = "freeze start", .usage = "freeze start --addr A --value V [--type T] [--offsets ...] [--interval MS] [--for MS]", .desc = "serve only: write a value in the background until 'freeze stop'. Returns the job id; --for MS stops it automatically." },
+    .{ .name = "freeze stop", .usage = "freeze stop (--id N | --all)", .desc = "serve only: stop background freeze jobs and return their final write counters." },
+    .{ .name = "freeze list", .usage = "freeze list", .desc = "serve only: list background freeze jobs with their addresses and write counters." },
+    .{ .name = "watch", .usage = "watch --addr A [--type T] [--offsets ...] [--interval MS] [--count N] [--timeout MS] [--changes-only]", .desc = "Sample a value repeatedly (blocking). Ctrl+C stops early; --timeout MS caps the total time." },
+    .{ .name = "watch start", .usage = "watch start --addr A [--type T] [--offsets ...] [--interval MS] [--count N] [--timeout MS] [--changes-only]", .desc = "serve only: sample a value in the background and collect the samples for 'watch poll'. Without --count or --timeout it runs until 'watch stop'." },
+    .{ .name = "watch poll", .usage = "watch poll --id N", .desc = "serve only: return the samples collected since the previous poll and clear them." },
+    .{ .name = "watch stop", .usage = "watch stop (--id N | --all)", .desc = "serve only: stop one background watch job and return its unpolled samples, or stop all (--all) with pending counts." },
+    .{ .name = "watch list", .usage = "watch list", .desc = "serve only: list background watch jobs with pending sample counts." },
     .{ .name = "table add", .usage = "table add (--addr A [--type T] [--offsets ...] | --from-scan INDEX) [--desc TEXT]", .desc = "Save an address in the session table." },
     .{ .name = "table list", .usage = "table list", .desc = "Show saved addresses with live values." },
     .{ .name = "table write", .usage = "table write --index N --value V", .desc = "Write a value to a saved address." },
@@ -910,6 +926,7 @@ const help_notes = [_][]const u8{
     "Run as Administrator to open most processes. Not for use against online games or protected processes.",
     "Session files are written atomically. If a saved session is corrupt it is moved to <name>.session.corrupt, a fresh session is started, and the response includes a 'notice' field.",
     "Long-running commands (scan, freeze, watch) stop on Ctrl+C and return a normal JSON response; freeze and watch also accept --timeout MS as an upper bound.",
+    "Background freeze and watch are available only in 'serve': 'freeze start|stop|list' and 'watch start|poll|stop|list'. A background watch keeps up to 10000 samples between polls and reports the rest as dropped; detaching or switching the target stops every background job.",
 };
 
 fn cmdHelp(w: *json.Writer) !void {
@@ -992,6 +1009,7 @@ fn cmdAttach(a: std.mem.Allocator, s: *Session, args: Args, w: *json.Writer) !vo
 }
 
 fn cmdDetach(a: std.mem.Allocator, s: *Session, w: *json.Writer) !void {
+    stopAllJobs(s);
     if (s.proc) |p| p.close();
     s.proc = null;
     s.pid = 0;
@@ -1246,7 +1264,386 @@ fn cmdSnapshot(a: std.mem.Allocator, s: *Session, args: Args, w: *json.Writer) !
     try w.kvInt("count", s.sc.matches.items.len);
 }
 
+const max_watch_pending = 10_000;
+
+const FreezeJob = struct {
+    id: u32,
+    pid: u32,
+    addr: usize,
+    kind: scan.Kind,
+    value: scan.Value,
+    interval: u32,
+    duration: u64,
+    writes: u64 = 0,
+    failures: u64 = 0,
+    active: std.atomic.Value(bool),
+    stop: std.atomic.Value(bool),
+    mutex: std.atomic.Mutex = .unlocked,
+    thread: ?std.Thread = null,
+};
+
+const WatchSample = struct {
+    t_ms: u64,
+    ok: bool,
+    value: [8]u8,
+};
+
+const WatchJob = struct {
+    id: u32,
+    pid: u32,
+    addr: usize,
+    kind: scan.Kind,
+    interval: u32,
+    duration: u32,
+    count: u64,
+    only_changes: bool,
+    samples: std.ArrayList(WatchSample) = .empty,
+    total: u64 = 0,
+    dropped: u64 = 0,
+    active: std.atomic.Value(bool),
+    stop: std.atomic.Value(bool),
+    mutex: std.atomic.Mutex = .unlocked,
+    thread: ?std.Thread = null,
+};
+
+const JobStats = struct { writes: u64, failures: u64 };
+const WatchStats = struct { pending: usize, total: u64, dropped: u64 };
+
+fn lockAtomic(m: *std.atomic.Mutex) void {
+    while (!m.tryLock()) std.atomic.spinLoopHint();
+}
+
+fn sleepJob(stop: *std.atomic.Value(bool), interval: u32, t0: u64, duration: u64) void {
+    var left: u64 = interval;
+    while (left > 0 and !stop.load(.acquire)) {
+        if (duration != 0) {
+            const elapsed = GetTickCount64() - t0;
+            if (elapsed >= duration) return;
+            left = @min(left, duration - elapsed);
+        }
+        const step: u32 = @intCast(@min(left, 20));
+        Sleep(step);
+        left -= step;
+    }
+}
+
+fn freezeWorker(job: *FreezeJob, p: win.Process) void {
+    defer p.close();
+    const t0 = GetTickCount64();
+    const sz = job.kind.size();
+    while (!job.stop.load(.acquire)) {
+        if (job.duration != 0 and GetTickCount64() - t0 >= job.duration) break;
+        if (p.write(job.addr, job.value.bytes[0..sz])) |_| {
+            lockAtomic(&job.mutex);
+            job.writes += 1;
+            job.mutex.unlock();
+        } else |_| {
+            lockAtomic(&job.mutex);
+            job.failures += 1;
+            job.mutex.unlock();
+        }
+        sleepJob(&job.stop, job.interval, t0, job.duration);
+    }
+    job.active.store(false, .release);
+}
+
+fn watchWorker(job: *WatchJob, p: win.Process) void {
+    defer p.close();
+    const t0 = GetTickCount64();
+    const sz = job.kind.size();
+    var prev: [8]u8 = std.mem.zeroes([8]u8);
+    var have_prev = false;
+    var i: u64 = 0;
+    while (!job.stop.load(.acquire) and (job.count == 0 or i < job.count)) : (i += 1) {
+        if (i > 0) {
+            sleepJob(&job.stop, job.interval, t0, job.duration);
+            if (job.stop.load(.acquire)) break;
+            if (job.duration != 0 and GetTickCount64() - t0 >= job.duration) break;
+        }
+        var cur: [8]u8 = std.mem.zeroes([8]u8);
+        const ok = if (p.read(job.addr, cur[0..sz])) |_| true else |_| false;
+        const changed = !have_prev or !ok or !std.mem.eql(u8, cur[0..sz], prev[0..sz]);
+        if (!job.only_changes or changed) {
+            lockAtomic(&job.mutex);
+            job.total += 1;
+            if (job.samples.items.len < max_watch_pending) {
+                job.samples.append(gpa, .{ .t_ms = GetTickCount64() - t0, .ok = ok, .value = cur }) catch {
+                    job.dropped += 1;
+                };
+            } else {
+                job.dropped += 1;
+            }
+            job.mutex.unlock();
+        }
+        if (ok) {
+            prev = cur;
+            have_prev = true;
+        }
+    }
+    job.active.store(false, .release);
+}
+
+fn freezeStats(job: *FreezeJob) JobStats {
+    lockAtomic(&job.mutex);
+    defer job.mutex.unlock();
+    return .{ .writes = job.writes, .failures = job.failures };
+}
+
+fn watchStats(job: *WatchJob) WatchStats {
+    lockAtomic(&job.mutex);
+    defer job.mutex.unlock();
+    return .{ .pending = job.samples.items.len, .total = job.total, .dropped = job.dropped };
+}
+
+fn drainWatchSamples(a: std.mem.Allocator, job: *WatchJob, dropped: *u64) ![]WatchSample {
+    lockAtomic(&job.mutex);
+    defer job.mutex.unlock();
+    const copy = try a.dupe(WatchSample, job.samples.items);
+    job.samples.clearRetainingCapacity();
+    dropped.* = job.dropped;
+    job.dropped = 0;
+    return copy;
+}
+
+fn stopFreeze(job: *FreezeJob) void {
+    job.stop.store(true, .release);
+    if (job.thread) |t| {
+        t.join();
+        job.thread = null;
+    }
+    job.active.store(false, .release);
+}
+
+fn stopWatch(job: *WatchJob) void {
+    job.stop.store(true, .release);
+    if (job.thread) |t| {
+        t.join();
+        job.thread = null;
+    }
+    job.active.store(false, .release);
+}
+
+fn destroyFreeze(job: *FreezeJob) void {
+    gpa.destroy(job);
+}
+
+fn destroyWatch(job: *WatchJob) void {
+    job.samples.deinit(gpa);
+    gpa.destroy(job);
+}
+
+fn stopAllJobs(s: *Session) void {
+    for (s.freezes.items) |job| {
+        stopFreeze(job);
+        destroyFreeze(job);
+    }
+    s.freezes.clearRetainingCapacity();
+    for (s.watches.items) |job| {
+        stopWatch(job);
+        destroyWatch(job);
+    }
+    s.watches.clearRetainingCapacity();
+}
+
+fn findFreeze(s: *Session, id: u32) ?usize {
+    for (s.freezes.items, 0..) |job, i| {
+        if (job.id == id) return i;
+    }
+    return null;
+}
+
+fn findWatch(s: *Session, id: u32) ?usize {
+    for (s.watches.items, 0..) |job, i| {
+        if (job.id == id) return i;
+    }
+    return null;
+}
+
+fn jobIdArg(args: Args) !u32 {
+    const t = args.opt("--id") orelse return fail(error.BadArgs, "missing --id (or use --all)", .{});
+    return parseU32(t);
+}
+
+fn backgroundIntervalArg(args: Args, default: u32) !u32 {
+    const t = args.opt("--interval") orelse return default;
+    const n = try parseU32(t);
+    if (n == 0 or n > 60_000) return fail(error.BadArgs, "--interval must be 1..60000 ms", .{});
+    return n;
+}
+
+fn nextJobId(id: u32) u32 {
+    const n = id +% 1;
+    return if (n == 0) 1 else n;
+}
+
+fn emitFreezeFields(w: *json.Writer, job: *FreezeJob) !void {
+    const st = freezeStats(job);
+    var ab: [24]u8 = undefined;
+    try w.kvInt("id", job.id);
+    try w.kvInt("pid", job.pid);
+    try w.kvStr("address", hexAddr(&ab, job.addr));
+    try w.kvStr("type", @tagName(job.kind));
+    try w.key("value");
+    try emitValue(w, job.kind, job.value.bytes[0..job.kind.size()]);
+    try w.kvInt("interval", job.interval);
+    try w.kvInt("writes", st.writes);
+    try w.kvInt("failures", st.failures);
+    try w.kvBool("active", job.active.load(.acquire));
+}
+
+fn emitFreezeJob(w: *json.Writer, job: *FreezeJob) !void {
+    try w.objectBegin();
+    try emitFreezeFields(w, job);
+    try w.objectEnd();
+}
+
+fn emitWatchSamples(w: *json.Writer, kind: scan.Kind, samples: []const WatchSample) !void {
+    try w.key("samples");
+    try w.arrayBegin();
+    for (samples) |sample| {
+        try w.objectBegin();
+        try w.kvInt("t_ms", sample.t_ms);
+        try w.key("value");
+        if (sample.ok) {
+            try emitValue(w, kind, sample.value[0..kind.size()]);
+        } else {
+            try w.nullv();
+        }
+        try w.objectEnd();
+    }
+    try w.arrayEnd();
+}
+
+fn emitWatchJob(w: *json.Writer, job: *WatchJob) !void {
+    const st = watchStats(job);
+    var ab: [24]u8 = undefined;
+    try w.objectBegin();
+    try w.kvInt("id", job.id);
+    try w.kvInt("pid", job.pid);
+    try w.kvStr("address", hexAddr(&ab, job.addr));
+    try w.kvStr("type", @tagName(job.kind));
+    try w.kvInt("interval", job.interval);
+    try w.kvBool("changes_only", job.only_changes);
+    try w.kvBool("active", job.active.load(.acquire));
+    try w.kvInt("pending", st.pending);
+    try w.kvInt("total", st.total);
+    try w.kvInt("dropped", st.dropped);
+    try w.objectEnd();
+}
+
+fn emitWatchResult(
+    w: *json.Writer,
+    job: *WatchJob,
+    samples: []const WatchSample,
+    dropped: u64,
+    total: u64,
+    stopped: bool,
+) !void {
+    var ab: [24]u8 = undefined;
+    try w.kvInt("id", job.id);
+    try w.kvStr("address", hexAddr(&ab, job.addr));
+    try w.kvStr("type", @tagName(job.kind));
+    try w.kvBool("active", job.active.load(.acquire));
+    if (stopped) try w.kvBool("stopped", true);
+    try w.kvInt("total", total);
+    try w.kvInt("dropped", dropped);
+    try emitWatchSamples(w, job.kind, samples);
+}
+
 fn cmdFreeze(a: std.mem.Allocator, s: *Session, args: Args, w: *json.Writer) !void {
+    const sub = args.pos(1) orelse return freezeBlocking(a, s, args, w);
+    if (std.mem.eql(u8, sub, "start")) return freezeStart(a, s, args, w);
+    if (std.mem.eql(u8, sub, "stop")) return freezeStop(s, args, w);
+    if (std.mem.eql(u8, sub, "list")) return freezeList(s, w);
+    return fail(error.BadArgs, "unknown freeze subcommand '{s}' (start, stop, list)", .{sub});
+}
+
+fn freezeStart(a: std.mem.Allocator, s: *Session, args: Args, w: *json.Writer) !void {
+    if (!s.serve)
+        return fail(error.ServeOnly, "background freeze is only available in 'serve'; use 'freeze --addr ...' for a blocking freeze", .{});
+
+    _ = try getProc(a, s, args);
+    const addr = try resolveAddr(a, s, s.proc.?, args);
+    const kind = try fixedKindArg(args);
+    const vt = args.opt("--value") orelse return fail(error.BadArgs, "missing --value", .{});
+    const val = try encodeArg(kind, vt, "--value");
+    const interval = try backgroundIntervalArg(args, 20);
+    const duration: u64 = if (args.opt("--for")) |t| try parseU64(t) else 0;
+    if (duration > 3_600_000) return fail(error.BadArgs, "--for must be <= 3600000 ms", .{});
+
+    const job = try gpa.create(FreezeJob);
+    job.* = .{
+        .id = s.next_job_id,
+        .pid = s.pid,
+        .addr = addr,
+        .kind = kind,
+        .value = val,
+        .interval = interval,
+        .duration = duration,
+        .active = std.atomic.Value(bool).init(true),
+        .stop = std.atomic.Value(bool).init(false),
+    };
+    const p = win.Process.open(s.pid) catch {
+        gpa.destroy(job);
+        return fail(error.OpenFailed, "cannot open PID {d}", .{s.pid});
+    };
+    job.thread = std.Thread.spawn(.{}, freezeWorker, .{ job, p }) catch {
+        p.close();
+        gpa.destroy(job);
+        return fail(error.ThreadFailed, "cannot start the background freeze thread", .{});
+    };
+    s.freezes.append(gpa, job) catch |e| {
+        stopFreeze(job);
+        gpa.destroy(job);
+        return e;
+    };
+    s.next_job_id = nextJobId(s.next_job_id);
+
+    var ab: [24]u8 = undefined;
+    try w.kvInt("id", job.id);
+    try w.kvStr("address", hexAddr(&ab, addr));
+    try w.kvStr("type", @tagName(kind));
+    try w.kvInt("interval", interval);
+    try w.kvBool("active", true);
+}
+
+fn freezeStop(s: *Session, args: Args, w: *json.Writer) !void {
+    if (!s.serve)
+        return fail(error.ServeOnly, "background freeze is only available in 'serve'", .{});
+
+    if (args.flag("--all")) {
+        try w.kvInt("count", s.freezes.items.len);
+        try w.key("stopped");
+        try w.arrayBegin();
+        for (s.freezes.items) |job| {
+            stopFreeze(job);
+            try emitFreezeJob(w, job);
+            destroyFreeze(job);
+        }
+        try w.arrayEnd();
+        s.freezes.clearRetainingCapacity();
+        return;
+    }
+
+    const id = try jobIdArg(args);
+    const idx = findFreeze(s, id) orelse return fail(error.NotFound, "no freeze job with id {d}", .{id});
+    const job = s.freezes.orderedRemove(idx);
+    stopFreeze(job);
+    try emitFreezeFields(w, job);
+    destroyFreeze(job);
+}
+
+fn freezeList(s: *Session, w: *json.Writer) !void {
+    if (!s.serve)
+        return fail(error.ServeOnly, "background freeze is only available in 'serve'", .{});
+    try w.kvInt("count", s.freezes.items.len);
+    try w.key("jobs");
+    try w.arrayBegin();
+    for (s.freezes.items) |job| try emitFreezeJob(w, job);
+    try w.arrayEnd();
+}
+
+fn freezeBlocking(a: std.mem.Allocator, s: *Session, args: Args, w: *json.Writer) !void {
     const p = try getProc(a, s, args);
     const addr = try resolveAddr(a, s, p, args);
     const kind = try fixedKindArg(args);
@@ -1282,6 +1679,118 @@ fn cmdFreeze(a: std.mem.Allocator, s: *Session, args: Args, w: *json.Writer) !vo
 }
 
 fn cmdWatch(a: std.mem.Allocator, s: *Session, args: Args, w: *json.Writer) !void {
+    const sub = args.pos(1) orelse return watchBlocking(a, s, args, w);
+    if (std.mem.eql(u8, sub, "start")) return watchStart(a, s, args, w);
+    if (std.mem.eql(u8, sub, "poll")) return watchPoll(a, s, args, w);
+    if (std.mem.eql(u8, sub, "stop")) return watchStop(a, s, args, w);
+    if (std.mem.eql(u8, sub, "list")) return watchList(s, w);
+    return fail(error.BadArgs, "unknown watch subcommand '{s}' (start, poll, stop, list)", .{sub});
+}
+
+fn watchStart(a: std.mem.Allocator, s: *Session, args: Args, w: *json.Writer) !void {
+    if (!s.serve)
+        return fail(error.ServeOnly, "background watch is only available in 'serve'; use 'watch --addr ...' for a blocking watch", .{});
+
+    _ = try getProc(a, s, args);
+    const addr = try resolveAddr(a, s, s.proc.?, args);
+    const kind = try fixedKindArg(args);
+    const interval = try backgroundIntervalArg(args, 100);
+    const count: u64 = if (args.opt("--count")) |t| try parseU64(t) else 0;
+    if (count > 100000) return fail(error.BadArgs, "--count must be 0..100000 (0 means unlimited)", .{});
+    const duration = try timeoutArg(args);
+    const only_changes = args.flag("--changes-only");
+
+    const job = try gpa.create(WatchJob);
+    job.* = .{
+        .id = s.next_job_id,
+        .pid = s.pid,
+        .addr = addr,
+        .kind = kind,
+        .interval = interval,
+        .duration = duration,
+        .count = count,
+        .only_changes = only_changes,
+        .active = std.atomic.Value(bool).init(true),
+        .stop = std.atomic.Value(bool).init(false),
+    };
+    const p = win.Process.open(s.pid) catch {
+        gpa.destroy(job);
+        return fail(error.OpenFailed, "cannot open PID {d}", .{s.pid});
+    };
+    job.thread = std.Thread.spawn(.{}, watchWorker, .{ job, p }) catch {
+        p.close();
+        gpa.destroy(job);
+        return fail(error.ThreadFailed, "cannot start the background watch thread", .{});
+    };
+    s.watches.append(gpa, job) catch |e| {
+        stopWatch(job);
+        destroyWatch(job);
+        return e;
+    };
+    s.next_job_id = nextJobId(s.next_job_id);
+
+    var ab: [24]u8 = undefined;
+    try w.kvInt("id", job.id);
+    try w.kvStr("address", hexAddr(&ab, addr));
+    try w.kvStr("type", @tagName(kind));
+    try w.kvInt("interval", interval);
+    try w.kvBool("changes_only", only_changes);
+    try w.kvBool("active", true);
+}
+
+fn watchPoll(a: std.mem.Allocator, s: *Session, args: Args, w: *json.Writer) !void {
+    if (!s.serve)
+        return fail(error.ServeOnly, "background watch is only available in 'serve'", .{});
+
+    const id = try jobIdArg(args);
+    const idx = findWatch(s, id) orelse return fail(error.NotFound, "no watch job with id {d}", .{id});
+    const job = s.watches.items[idx];
+    var dropped: u64 = 0;
+    const samples = try drainWatchSamples(a, job, &dropped);
+    const total = watchStats(job).total;
+    try emitWatchResult(w, job, samples, dropped, total, false);
+}
+
+fn watchStop(a: std.mem.Allocator, s: *Session, args: Args, w: *json.Writer) !void {
+    if (!s.serve)
+        return fail(error.ServeOnly, "background watch is only available in 'serve'", .{});
+
+    if (args.flag("--all")) {
+        try w.kvInt("count", s.watches.items.len);
+        try w.key("stopped");
+        try w.arrayBegin();
+        for (s.watches.items) |job| {
+            stopWatch(job);
+            try emitWatchJob(w, job);
+            destroyWatch(job);
+        }
+        try w.arrayEnd();
+        s.watches.clearRetainingCapacity();
+        return;
+    }
+
+    const id = try jobIdArg(args);
+    const idx = findWatch(s, id) orelse return fail(error.NotFound, "no watch job with id {d}", .{id});
+    const job = s.watches.orderedRemove(idx);
+    stopWatch(job);
+    var dropped: u64 = 0;
+    const samples = try drainWatchSamples(a, job, &dropped);
+    const total = watchStats(job).total;
+    try emitWatchResult(w, job, samples, dropped, total, true);
+    destroyWatch(job);
+}
+
+fn watchList(s: *Session, w: *json.Writer) !void {
+    if (!s.serve)
+        return fail(error.ServeOnly, "background watch is only available in 'serve'", .{});
+    try w.kvInt("count", s.watches.items.len);
+    try w.key("jobs");
+    try w.arrayBegin();
+    for (s.watches.items) |job| try emitWatchJob(w, job);
+    try w.arrayEnd();
+}
+
+fn watchBlocking(a: std.mem.Allocator, s: *Session, args: Args, w: *json.Writer) !void {
     const p = try getProc(a, s, args);
     const addr = try resolveAddr(a, s, p, args);
     const kind = try fixedKindArg(args);
@@ -1532,7 +2041,7 @@ fn tokenize(a: std.mem.Allocator, line: []const u8) ![]const []const u8 {
 var line_buf: [16384]u8 = undefined;
 
 fn serve() void {
-    var s: Session = .{ .name = "serve", .file_backed = false };
+    var s: Session = .{ .name = "serve", .file_backed = false, .serve = true };
     {
         var arena = std.heap.ArenaAllocator.init(gpa);
         defer arena.deinit();
@@ -1568,6 +2077,7 @@ fn serve() void {
         w.buf.append(a, '\n') catch {};
         win.writeStdout(w.buf.items);
     }
+    stopAllJobs(&s);
     if (s.proc) |p| p.close();
 }
 
@@ -1682,6 +2192,97 @@ fn appendZeros(a: std.mem.Allocator, list: *std.ArrayList(u8), n: usize) !void {
         try list.appendSlice(a, zeros[0..take]);
         left -= take;
     }
+}
+
+test "background freeze and watch require serve" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+    var s: Session = .{ .name = "oneshot" };
+    defer freeSession(&s);
+    var w = json.Writer.init(a);
+
+    const freeze_argv = [_][]const u8{ "freeze", "start", "--addr", "0x1000", "--value", "1" };
+    try std.testing.expectEqual(@as(u8, 2), run(a, &s, &freeze_argv, &w));
+    try std.testing.expect(std.mem.indexOf(u8, w.buf.items, "\"ServeOnly\"") != null);
+
+    const watch_argv = [_][]const u8{ "watch", "start", "--addr", "0x1000" };
+    try std.testing.expectEqual(@as(u8, 2), run(a, &s, &watch_argv, &w));
+    try std.testing.expect(std.mem.indexOf(u8, w.buf.items, "\"ServeOnly\"") != null);
+
+    const list_argv = [_][]const u8{ "freeze", "list" };
+    try std.testing.expectEqual(@as(u8, 2), run(a, &s, &list_argv, &w));
+}
+
+test "background freeze writes until stopped" {
+    var target: i32 = 0;
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+    var s: Session = .{ .name = "bgfreeze", .file_backed = false, .serve = true };
+    defer freeSession(&s);
+    var w = json.Writer.init(a);
+
+    var pid_buf: [24]u8 = undefined;
+    const pid = try std.fmt.bufPrint(&pid_buf, "{d}", .{win.GetCurrentProcessId()});
+    var addr_buf: [24]u8 = undefined;
+    const addr = try std.fmt.bufPrint(&addr_buf, "0x{X}", .{@intFromPtr(&target)});
+
+    const attach_argv = [_][]const u8{ "attach", "--pid", pid };
+    try std.testing.expectEqual(@as(u8, 0), run(a, &s, &attach_argv, &w));
+
+    const start_argv = [_][]const u8{ "freeze", "start", "--addr", addr, "--value", "4321", "--type", "int32", "--interval", "5" };
+    try std.testing.expectEqual(@as(u8, 0), run(a, &s, &start_argv, &w));
+    try std.testing.expect(std.mem.indexOf(u8, w.buf.items, "\"id\":1") != null);
+
+    var waited: u32 = 0;
+    while (waited < 2000 and freezeStats(s.freezes.items[0]).writes == 0) : (waited += 10) Sleep(10);
+    try std.testing.expect(freezeStats(s.freezes.items[0]).writes > 0);
+
+    const stop_argv = [_][]const u8{ "freeze", "stop", "--id", "1" };
+    try std.testing.expectEqual(@as(u8, 0), run(a, &s, &stop_argv, &w));
+    try std.testing.expect(std.mem.indexOf(u8, w.buf.items, "\"active\":false") != null);
+    try std.testing.expectEqual(@as(i32, 4321), target);
+    try std.testing.expectEqual(@as(usize, 0), s.freezes.items.len);
+}
+
+test "background watch collects changes for poll" {
+    var target: i32 = 0;
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+    var s: Session = .{ .name = "bgwatch", .file_backed = false, .serve = true };
+    defer freeSession(&s);
+    var w = json.Writer.init(a);
+
+    var pid_buf: [24]u8 = undefined;
+    const pid = try std.fmt.bufPrint(&pid_buf, "{d}", .{win.GetCurrentProcessId()});
+    var addr_buf: [24]u8 = undefined;
+    const addr = try std.fmt.bufPrint(&addr_buf, "0x{X}", .{@intFromPtr(&target)});
+
+    const attach_argv = [_][]const u8{ "attach", "--pid", pid };
+    try std.testing.expectEqual(@as(u8, 0), run(a, &s, &attach_argv, &w));
+
+    const start_argv = [_][]const u8{ "watch", "start", "--addr", addr, "--type", "int32", "--interval", "5", "--changes-only" };
+    try std.testing.expectEqual(@as(u8, 0), run(a, &s, &start_argv, &w));
+    try std.testing.expect(std.mem.indexOf(u8, w.buf.items, "\"id\":1") != null);
+
+    var waited: u32 = 0;
+    while (waited < 2000 and watchStats(s.watches.items[0]).pending < 1) : (waited += 10) Sleep(10);
+    @atomicStore(i32, &target, 99, .seq_cst);
+    waited = 0;
+    while (waited < 2000 and watchStats(s.watches.items[0]).pending < 2) : (waited += 10) Sleep(10);
+    try std.testing.expect(watchStats(s.watches.items[0]).pending >= 2);
+
+    const poll_argv = [_][]const u8{ "watch", "poll", "--id", "1" };
+    try std.testing.expectEqual(@as(u8, 0), run(a, &s, &poll_argv, &w));
+    try std.testing.expect(std.mem.indexOf(u8, w.buf.items, "\"value\":99") != null);
+    try std.testing.expect(std.mem.indexOf(u8, w.buf.items, "\"samples\":[") != null);
+
+    const stop_argv = [_][]const u8{ "watch", "stop", "--id", "1" };
+    try std.testing.expectEqual(@as(u8, 0), run(a, &s, &stop_argv, &w));
+    try std.testing.expect(std.mem.indexOf(u8, w.buf.items, "\"stopped\":true") != null);
+    try std.testing.expectEqual(@as(usize, 0), s.watches.items.len);
 }
 
 test "session roundtrip keeps matches and table" {
