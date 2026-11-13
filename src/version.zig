@@ -1,1 +1,1 @@
-pub const string = "1.8";
+pub const string = "1.9";

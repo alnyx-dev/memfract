@@ -1,6 +1,6 @@
 .{
     .name = .memfract,
-    .version = "1.8.0",
+    .version = "1.9.0",
     .fingerprint = 0xc4c1d369d7c223fd,
     .minimum_zig_version = "0.17.0",
     .dependencies = .{},

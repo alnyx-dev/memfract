@@ -5,6 +5,26 @@ and versions follow the `DEPTH.ITERATION` scheme described in `AGENTS.md`.
 
 ## [Unreleased]
 
+## [1.9] — 2026-11-13
+
+### Added
+
+- `pointer scan --addr A [--max-depth N] [--max-offset X] [--module NAME]
+  [--max-results N] [--timeout MS]` finds pointer chains that end at `A`. A chain starts
+  at a static address in a loaded module and is printed as `base` plus `offsets`, ready
+  for `--addr BASE --offsets o1,o2`.
+- `table add --from-pointer INDEX` resolves a chain found by `pointer scan` and saves the
+  address it currently reaches.
+- Pointer scan responses report `count`, `truncated`, `canceled`, `slots`, `bytes_read`,
+  and `elapsed_ms`. `--max-results` and the internal index and step budgets set
+  `truncated`; Ctrl+C and `--timeout` stop the walk early and set `canceled`.
+
+### Changed
+
+- The session file format is now `ZCS5`; files written by `ZCS4`, `ZCS3`, and `ZCS2` are
+  still readable. Pointer chains found by `pointer scan` stay in the session until the
+  next pointer scan, `detach`, or a switch to another PID.
+
 ## [1.8] — 2026-11-13
 
 ### Fixed
