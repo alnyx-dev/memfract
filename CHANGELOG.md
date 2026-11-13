@@ -5,6 +5,30 @@ and versions follow the `DEPTH.ITERATION` scheme described in `AGENTS.md`.
 
 ## [Unreleased]
 
+## [1.7] — 2026-11-13
+
+### Added
+
+- `freeze start|stop|list` and `watch start|poll|stop|list` in `serve` run on
+  background threads, so values stay frozen and samples keep accumulating while other
+  commands run.
+- `freeze start` takes `--for MS` to stop a job automatically; `watch start` takes
+  `--count N` and `--timeout MS` as optional limits and `--changes-only` to record only
+  changed values.
+- Background watch jobs keep up to 10000 samples between polls. `watch poll` returns the
+  pending samples and clears them; `watch stop --id` returns the samples that were not
+  polled yet, while `watch stop --all` returns pending counts and discards them. Both
+  report `dropped` when the buffer overflowed.
+
+### Changed
+
+- Background jobs use their own process handle, so unrelated commands can attach,
+  detach, or scan without disturbing them.
+- `detach` and switching to another PID stop every background freeze and watch job,
+  because they target the previous process.
+- One-shot `freeze` and `watch` stay blocking; `freeze start` and `watch start` outside
+  `serve` fail with `ServeOnly`.
+
 ## [1.6] — 2026-11-12
 
 ### Added
