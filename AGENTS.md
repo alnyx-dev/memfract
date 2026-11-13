@@ -61,6 +61,9 @@ the output is a repeatable MiB/s figure, not a pass/fail check.
   `StaleSession`, not silently reuse results.
 - `serve` reads one command per line from stdin and keeps state in memory.
   Reset per-command flags (`interrupted`) at the start of each command.
+- Background `freeze start` and `watch start` jobs own a duplicate process handle and a
+  worker thread. Stop them (`stopAllJobs`) on `detach`, on a switch to another PID, and
+  when `serve` exits; workers must be joined, never detached.
 - Addresses are written as fixed-width `0x%016X` (`hexAddr`). Inputs accept `0x...` or
   `module+offset`; `--offsets` follows a pointer chain.
 

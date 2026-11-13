@@ -113,6 +113,25 @@ For a series of commands, use `serve`:
 @('attach --pid 4242', 'scan first --type int32 --value 100', 'exit') | .\zig-out\bin\memfract.exe serve
 ```
 
+Inside `serve`, `freeze start|stop|list` and `watch start|poll|stop|list` keep working on
+background threads. A frozen value is rewritten while other commands run, and `watch poll`
+returns the samples collected since the previous poll:
+
+```powershell
+@(
+    'attach --pid 4242',
+    'freeze start --addr game.exe+0x1A2B3C --value 100 --type int32',
+    'watch start --addr game.exe+0x1A2B3C --type int32 --changes-only',
+    'scan first --type int32 --value 100',
+    'watch poll --id 2',
+    'freeze stop --id 1',
+    'exit'
+) | .\zig-out\bin\memfract.exe serve
+```
+
+Background jobs use their own process handle and stop when you detach or switch targets;
+`freeze stop --all` and `watch stop --all` stop them all at once.
+
 ## GUI
 
 Run `zig-out\bin\memfract-gui.exe` as administrator. The scanner and address table share one window
